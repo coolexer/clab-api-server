@@ -3,6 +3,12 @@ name: Build and Release
 on:
   release:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to build (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
 
 permissions:
   contents: write # Needed for uploading release assets
@@ -27,7 +33,7 @@ jobs:
     - name: Export build metadata
       run: |
         # Use the release tag name directly for VERSION
-        echo "VERSION=${{ github.event.release.tag_name }}" >>"$GITHUB_ENV"
+        echo "VERSION=${{ github.event.release.tag_name || inputs.tag_name }}" >>"$GITHUB_ENV"
         echo "COMMIT=$(git rev-parse --short HEAD || echo unknown)" >>"$GITHUB_ENV"
         echo "DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >>"$GITHUB_ENV"
         echo "REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
@@ -140,7 +146,7 @@ jobs:
       with:
         images: ghcr.io/${{ env.REPO_LOWER }}/clab-api-server # Use lowercase repo name
         tags: |
-          type=raw,value=${{ github.event.release.tag_name }}
+          type=raw,value=${{ github.event.release.tag_name || inputs.tag_name }}
           type=raw,value=latest
           type=sha # Git SHA
 
