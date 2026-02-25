@@ -110,6 +110,13 @@ type ClabContainerInfo struct {
 	Owner       string `json:"owner"`        // OS user from clab inspect output (Used for authorization)
 }
 
+// InspectLabResponse is returned by GET /api/v1/labs/{labName} when topology=true is set.
+// It wraps the container list together with the raw topology-data.json produced by containerlab.
+type InspectLabResponse struct {
+	Containers   []ClabContainerInfo `json:"containers"`
+	TopologyData json.RawMessage     `json:"topology_data,omitempty"`
+}
+
 // --- Structs for parsing `clab inspect interfaces --format json` output ---
 
 // ClabInspectInterfacesOutput is the top-level array structure
