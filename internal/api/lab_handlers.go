@@ -731,16 +731,22 @@ func InspectLabHandler(c *gin.Context) {
 	}
 
 	// Read topology-data.json from the lab directory.
-	labDir, _, _, dirErr := getLabDirectoryInfo(username, labName)
+	// Use the absolute lab path from the first container's metadata
 	var topoData json.RawMessage
-	if dirErr != nil {
-		log.Warnf("InspectLab user '%s': could not resolve lab directory for '%s': %v", username, labName, dirErr)
-	} else {
-		topoPath := filepath.Join(labDir, "topology-data.json")
-		if raw, readErr := os.ReadFile(topoPath); readErr == nil {
-			topoData = json.RawMessage(raw)
-		} else {
-			log.Warnf("InspectLab user '%s': could not read topology-data.json for lab '%s' at '%s': %v", username, labName, topoPath, readErr)
+	if len(labContainers) > 0 {
+		// Get the lab directory from the absolute path of the topology file
+		// e.g., /home/clab/claude-test/claude-srsim.clab.yml -> /home/clab/claude-test/clab-claude-srsim
+		absLabPath := labContainers[0].AbsLabPath
+		if absLabPath != "" {
+			labDir := filepath.Dir(absLabPath)
+			// The topology-data.json is in the lab directory with name pattern clab-<labName>
+			topoPath := filepath.Join(labDir, fmt.Sprintf("clab-%s", labName), "topology-data.json")
+			if raw, readErr := os.ReadFile(topoPath); readErr == nil {
+				topoData = json.RawMessage(raw)
+				log.Debugf("InspectLab user '%s': Successfully read topology-data.json from '%s'", username, topoPath)
+			} else {
+				log.Warnf("InspectLab user '%s': could not read topology-data.json for lab '%s' at '%s': %v", username, labName, topoPath, readErr)
+			}
 		}
 	}
 
