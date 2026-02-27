@@ -45,7 +45,7 @@ Download the binary and run it directly with sudo:
 
 ```bash
 # Download the latest release for your architecture
-curl -sLO https://github.com/srl-labs/clab-api-server/releases/latest/download/clab-api-server-linux-amd64
+curl -sLO https://github.com/coolexer/clab-api-server/releases/latest/download/clab-api-server-linux-amd64
 
 # Make it executable
 chmod +x clab-api-server-linux-amd64
@@ -65,7 +65,7 @@ Once the server is running, access the interactive API documentation at:
 Install as a systemd service for automatic startup:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/srl-labs/clab-api-server/main/install.sh | sudo -E bash
+curl -sL https://raw.githubusercontent.com/coolexer/clab-api-server/main/install.sh | sudo -E bash
 ```
 
 This will:
@@ -94,7 +94,7 @@ docker run -d \
   -v /etc/group:/etc/group:ro \
   -v /etc/gshadow:/etc/gshadow:ro \
   -v /home:/home \
-  ghcr.io/srl-labs/clab-api-server/clab-api-server:latest
+  ghcr.io/coolexer/clab-api-server/clab-api-server:latest
 ```
 > [!NOTE]
 > Volume mounts enable Docker management, networking features, Linux PAM authentication, and user file storage. No containerlab binary is required - it's integrated as a Go library.
@@ -233,7 +233,7 @@ The collection makes use of the following variables:
 For development setup:
 
 ```bash
-git clone https://github.com/srl-labs/clab-api-server.git
+git clone https://github.com/coolexer/clab-api-server.git
 cd clab-api-server
 cp .env.example .env      # edit JWT_SECRET
 

@@ -4,19 +4,19 @@
 #
 # ── Quick examples ──────────────────────────────────────────────────────────────
 #   # Install the latest release (service is created but NOT enabled)
-#   curl -sL https://raw.githubusercontent.com/srl-labs/clab-api-server/refs/heads/main/install.sh \
+#   curl -sL https://raw.githubusercontent.com/coolexer/clab-api-server/refs/heads/main/install.sh \
 #     | sudo -E bash -s -- install
 #
 #   # Same as above (‑s -- lets you omit the action because it defaults to "install")
-#   curl -sL https://raw.githubusercontent.com/srl-labs/clab-api-server/refs/heads/main/install.sh \
+#   curl -sL https://raw.githubusercontent.com/coolexer/clab-api-server/refs/heads/main/install.sh \
 #     | sudo -E bash -s --            # action defaults to "install"
 #
 #   # Install a specific version
-#   curl -sL https://raw.githubusercontent.com/srl-labs/clab-api-server/refs/heads/main/install.sh \
+#   curl -sL https://raw.githubusercontent.com/coolexer/clab-api-server/refs/heads/main/install.sh \
 #     | sudo -E bash -s -- --version clab-0.73.0-api-0.2.1
 #
 #   # Just pull the binary (no env file / service)
-#   curl -sL https://raw.githubusercontent.com/srl-labs/clab-api-server/refs/heads/main/install.sh \
+#   curl -sL https://raw.githubusercontent.com/coolexer/clab-api-server/refs/heads/main/install.sh \
 #     | sudo -E bash -s -- pull-only --version clab-0.73.0-api-0.2.1
 #
 #   # Upgrade an existing installation (script is already on disk)
@@ -33,7 +33,7 @@
 
 set -euo pipefail
 
-REPO="srl-labs/clab-api-server"
+REPO="coolexer/clab-api-server"
 BIN_DIR="/usr/local/bin"
 BIN_PATH="${BIN_DIR}/clab-api-server"
 ENV_FILE="/etc/clab-api-server.env"  # file created by this script; edit after install
@@ -148,7 +148,7 @@ create_service() {
   sudo tee "$SERVICE_FILE" >/dev/null <<EOF
 [Unit]
 Description=Containerlab API Server
-Documentation=https://github.com/srl-labs/clab-api-server
+Documentation=https://github.com/coolexer/clab-api-server
 After=network.target docker.service
 
 [Service]
