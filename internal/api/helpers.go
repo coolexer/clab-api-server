@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/log"
 	"github.com/gin-gonic/gin"
@@ -29,6 +30,8 @@ import (
 
 // isValidLabName checks for potentially harmful characters in lab names.
 var labNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+const clabLabsRootEnv = "CLAB_LABS_ROOT"
 
 // isValidContainerName checks container names (often includes lab prefix)
 var containerNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`) // Docker's typical naming restrictions
@@ -99,6 +102,18 @@ func isValidCertName(name string) bool {
 		return false
 	}
 	return certNameRegex.MatchString(name)
+}
+
+func isValidRuntimeImageReference(reference string) bool {
+	if reference == "" || strings.TrimSpace(reference) != reference || len(reference) > 512 {
+		return false
+	}
+	for _, r := range reference {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // isValidDurationString checks if a string can be parsed as a duration >= 0
@@ -245,8 +260,7 @@ func getLabInfo(ctx context.Context, username string, labName string) (info *mod
 	return &labContainers[0], true, nil // Lab exists
 }
 
-// ensureLabOwnerLabels re-applies the desired owner label to all containers in a lab.
-// verifyLabOwnership checks if a lab exists and is owned by the user.
+// verifyLabOwnership checks access to an owned or shared lab, including superusers.
 // Returns the original topology path (if found) and nil error on success.
 // Sends appropriate HTTP error response and returns non-nil error on failure.
 func verifyLabOwnership(c *gin.Context, username, labName string) (string, error) {
@@ -284,7 +298,7 @@ func verifyLabOwnership(c *gin.Context, username, labName string) (string, error
 		return originalTopoPath, nil // Superuser confirmed
 	}
 
-	if actualOwner != username {
+	if !canAccessLab(username, labInfo) {
 		log.Warnf("Ownership check failed for user '%s': Attempted to access lab '%s' but it is owned by '%s'. Access denied.", username, labName, actualOwner)
 		// Use 404 for security (don't reveal existence if not owned)
 		errResp := fmt.Errorf("lab '%s' not found or not owned by user", labName)
@@ -349,7 +363,7 @@ func verifyContainerOwnership(c *gin.Context, username, containerName string) (*
 	}
 
 	// Check ownership if not superuser
-	if !isSuperuser(username) && foundContainer.Owner != username {
+	if !canAccessLab(username, foundContainer) {
 		log.Warnf("Container ownership check failed for user '%s': Attempted to access container '%s' but it is owned by '%s'. Access denied.", username, containerName, foundContainer.Owner)
 		err := fmt.Errorf("container '%s' not found or not owned by user", containerName)
 		c.JSON(http.StatusNotFound, models.ErrorResponse{Error: err.Error()}) // 404 for security
@@ -587,11 +601,24 @@ func extractTarGz(archiveReader io.Reader, targetDir string, uid, gid int) error
 	return nil
 }
 
-// getLabDirectoryInfo returns the appropriate directory path for a lab based on environment variables,
-// along with the user's UID/GID for ownership operations.
-// If CLAB_SHARED_LABS_DIR is set, it returns $CLAB_SHARED_LABS_DIR/users/$username/$labName
-// Otherwise, it returns $HOME/.clab/$labName
-func getLabDirectoryInfo(username, labName string) (targetDir string, uid, gid int, err error) {
+func configuredLabsRoot() (string, error) {
+	root := strings.TrimSpace(config.AppConfig.ClabLabsRoot)
+	if root == "" {
+		root = strings.TrimSpace(os.Getenv(clabLabsRootEnv))
+	}
+	if root == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(root, "~") {
+		return "", fmt.Errorf("%s must be an absolute path; '~' is not supported", clabLabsRootEnv)
+	}
+	if !filepath.IsAbs(root) {
+		return "", fmt.Errorf("%s must be an absolute path", clabLabsRootEnv)
+	}
+	return filepath.Clean(root), nil
+}
+
+func getUserLabsBaseDirectoryInfo(username string) (baseDir string, uid, gid int, err error) {
 	// Get user details first (needed for UID/GID regardless of path)
 	usr, err := user.Lookup(username)
 	if err != nil {
@@ -608,12 +635,67 @@ func getLabDirectoryInfo(username, labName string) (targetDir string, uid, gid i
 		return "", -1, -1, fmt.Errorf("could not process user GID: %w", gidErr)
 	}
 
-	// Determine the target directory
-	sharedDir := os.Getenv("CLAB_SHARED_LABS_DIR")
-	if sharedDir != "" {
-		return filepath.Join(sharedDir, "users", username, labName), uid, gid, nil
+	labsRoot, rootErr := configuredLabsRoot()
+	if rootErr != nil {
+		return "", -1, -1, rootErr
+	}
+	if labsRoot != "" {
+		return filepath.Join(labsRoot, username), uid, gid, nil
 	}
 
 	// Fall back to user's home directory
-	return filepath.Join(usr.HomeDir, ".clab", labName), uid, gid, nil
+	return filepath.Join(usr.HomeDir, ".clab"), uid, gid, nil
+}
+
+// getLabDirectoryInfo returns the appropriate directory path for a lab,
+// along with the user's UID/GID for ownership operations.
+// If CLAB_LABS_ROOT is set, it returns $CLAB_LABS_ROOT/$username/$labName.
+// Otherwise, it returns $HOME/.clab/$labName.
+func getLabDirectoryInfo(username, labName string) (targetDir string, uid, gid int, err error) {
+	baseDir, uid, gid, err := getUserLabsBaseDirectoryInfo(username)
+	if err != nil {
+		return "", -1, -1, err
+	}
+	return filepath.Join(baseDir, labName), uid, gid, nil
+}
+
+func ensureUserLabsBaseDirectory(baseDir string, uid, gid int) error {
+	labsRoot, err := configuredLabsRoot()
+	if err != nil {
+		return err
+	}
+	if labsRoot != "" {
+		cleanLabsRoot := filepath.Clean(labsRoot)
+		cleanBaseDir := filepath.Clean(baseDir)
+		if cleanBaseDir == cleanLabsRoot || !pathIsInsideRoot(cleanLabsRoot, cleanBaseDir) {
+			return fmt.Errorf("labs base directory escapes %s", clabLabsRootEnv)
+		}
+		if err := os.MkdirAll(cleanLabsRoot, 0755); err != nil {
+			return err
+		}
+		if err := os.Chmod(cleanLabsRoot, 0755); err != nil && !os.IsNotExist(err) {
+			log.Warnf("Failed to set permissions for labs root '%s': %v", labsRoot, err)
+		}
+	}
+
+	if err := os.MkdirAll(baseDir, 0750); err != nil {
+		return err
+	}
+	if err := os.Chown(baseDir, uid, gid); err != nil {
+		log.Warnf("Failed to set ownership for labs directory '%s' to %d:%d: %v", baseDir, uid, gid, err)
+	}
+	return nil
+}
+
+func ensureLabDirectory(labDir string, uid, gid int) error {
+	if err := ensureUserLabsBaseDirectory(filepath.Dir(labDir), uid, gid); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(labDir, 0750); err != nil {
+		return err
+	}
+	if err := os.Chown(labDir, uid, gid); err != nil {
+		log.Warnf("Failed to set ownership for lab directory '%s' to %d:%d: %v", labDir, uid, gid, err)
+	}
+	return nil
 }

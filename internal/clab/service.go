@@ -3,16 +3,21 @@ package clab
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"net"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/log"
@@ -38,6 +43,7 @@ import (
 const (
 	defaultTimeout         = 5 * time.Minute
 	gracefulDestroyTimeout = 2 * time.Minute
+	imagePullTimeout       = 30 * time.Minute
 )
 
 var ErrNetemInterfaceNotFound = errors.New("netem interface not found")
@@ -50,9 +56,225 @@ func NewService() *Service {
 	return &Service{}
 }
 
+// containerlabMu protects containerlab's process-wide owner environment, working
+// directory and special link nodes. Stateful operations hold it from construction
+// through completion; constructors used by read-only requests take the same lock.
+var containerlabMu sync.Mutex
+
+// lockContainerlabOperation gives one operation exclusive use of the host and
+// mgmt-net pseudo nodes. Clear stale endpoints before link resolution and release
+// references afterwards, including when an operation fails. This only forgets
+// endpoint objects; it does not remove interfaces belonging to running labs.
+func lockContainerlabOperation() func() {
+	containerlabMu.Lock()
+	drainSpecialLinkNodes()
+	return func() {
+		drainSpecialLinkNodes()
+		containerlabMu.Unlock()
+	}
+}
+
+// drainSpecialLinkNodes restores the state a fresh containerlab CLI process sees.
+// Callers must hold containerlabMu while draining and using these shared nodes.
+func drainSpecialLinkNodes() {
+	for _, n := range []clablinks.Node{clablinks.GetHostLinkNode(), clablinks.GetMgmtBrLinkNode()} {
+		if n == nil {
+			continue
+		}
+		// Copy first: ReleaseEndpoint changes the slice we would be ranging over.
+		for _, ep := range append([]clablinks.Endpoint(nil), n.GetEndpoints()...) {
+			_ = n.ReleaseEndpoint(ep)
+		}
+	}
+	// Containerlab renames this singleton to the management bridge. Leaving that
+	// name behind can shadow a topology's bridge node during the next resolution.
+	_ = clablinks.SetMgmtNetUnderlyingBridge("mgmt-net")
+}
+
+func newContainerLab(opts ...clabcore.ClabOption) (*clabcore.CLab, error) {
+	containerlabMu.Lock()
+	defer containerlabMu.Unlock()
+
+	return clabcore.NewContainerLab(opts...)
+}
+
+func newContainerLabForOwner(owner string, opts ...clabcore.ClabOption) (*clabcore.CLab, error) {
+	containerlabMu.Lock()
+	defer containerlabMu.Unlock()
+
+	restoreOwnerEnv := setProcessOwnerEnv(owner)
+	defer restoreOwnerEnv()
+
+	return clabcore.NewContainerLab(opts...)
+}
+
+func setProcessOwnerEnv(owner string) func() {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return func() {}
+	}
+
+	sudoUser, sudoUserSet := os.LookupEnv("SUDO_USER")
+	userEnv, userSet := os.LookupEnv("USER")
+	sudoUID, sudoUIDSet := os.LookupEnv("SUDO_UID")
+	sudoGID, sudoGIDSet := os.LookupEnv("SUDO_GID")
+
+	// containerlab falls back to SUDO_USER/USER when its owner option is ignored.
+	_ = os.Setenv("SUDO_USER", owner)
+	_ = os.Setenv("USER", owner)
+	if usr, err := user.Lookup(owner); err == nil {
+		_ = os.Setenv("SUDO_UID", usr.Uid)
+		_ = os.Setenv("SUDO_GID", usr.Gid)
+	}
+
+	return func() {
+		restoreEnv("SUDO_USER", sudoUser, sudoUserSet)
+		restoreEnv("USER", userEnv, userSet)
+		restoreEnv("SUDO_UID", sudoUID, sudoUIDSet)
+		restoreEnv("SUDO_GID", sudoGID, sudoGIDSet)
+	}
+}
+
+func restoreEnv(key, value string, wasSet bool) {
+	if wasSet {
+		_ = os.Setenv(key, value)
+		return
+	}
+	_ = os.Unsetenv(key)
+}
+
+type rootLinkNode struct {
+	shortName string
+	endpoints []clablinks.Endpoint
+	nspath    string
+}
+
+func newRootLinkNode(shortName string) (*rootLinkNode, error) {
+	currns, err := ns.GetCurrentNS()
+	if err != nil {
+		return nil, err
+	}
+	defer currns.Close()
+
+	return &rootLinkNode{
+		shortName: shortName,
+		endpoints: []clablinks.Endpoint{},
+		nspath:    currns.Path(),
+	}, nil
+}
+
+func (n *rootLinkNode) AddLinkToContainer(_ context.Context, link netlink.Link, f func(ns.NetNS) error) error {
+	netns, err := ns.GetNS(n.nspath)
+	if err != nil {
+		return err
+	}
+	defer netns.Close()
+
+	if err := netlink.LinkSetNsFd(link, int(netns.Fd())); err != nil {
+		return err
+	}
+
+	return netns.Do(f)
+}
+
+func (n *rootLinkNode) AddEndpoint(e clablinks.Endpoint) error {
+	n.endpoints = append(n.endpoints, e)
+	return nil
+}
+
+func (n *rootLinkNode) AdoptEndpoint(e clablinks.Endpoint) error {
+	if e == nil {
+		return fmt.Errorf("node %q cannot adopt a nil endpoint", n.shortName)
+	}
+
+	owner := e.GetNode()
+	if owner == nil {
+		return fmt.Errorf(
+			"node %q cannot adopt endpoint %q without an owner",
+			n.shortName,
+			e.GetIfaceName(),
+		)
+	}
+	if owner.GetShortName() != n.shortName {
+		return fmt.Errorf(
+			"node %q cannot adopt endpoint %q owned by %q",
+			n.shortName,
+			e.GetIfaceName(),
+			owner.GetShortName(),
+		)
+	}
+
+	for _, owned := range n.endpoints {
+		if owned == e {
+			return nil
+		}
+		if owned.GetIfaceName() == e.GetIfaceName() {
+			return fmt.Errorf(
+				"node %q already tracks interface %q",
+				n.shortName,
+				e.GetIfaceName(),
+			)
+		}
+	}
+
+	n.endpoints = append(n.endpoints, e)
+	return nil
+}
+
+func (n *rootLinkNode) ReleaseEndpoint(e clablinks.Endpoint) error {
+	for i, owned := range n.endpoints {
+		if owned != e {
+			continue
+		}
+
+		n.endpoints = append(n.endpoints[:i], n.endpoints[i+1:]...)
+		return nil
+	}
+
+	return fmt.Errorf("node %q does not own endpoint %q", n.shortName, e.GetIfaceName())
+}
+
+func (*rootLinkNode) GetLinkEndpointType() clablinks.LinkEndpointType {
+	return clablinks.LinkEndpointTypeHost
+}
+
+func (n *rootLinkNode) GetShortName() string {
+	return n.shortName
+}
+
+func (n *rootLinkNode) GetEndpoints() []clablinks.Endpoint {
+	return n.endpoints
+}
+
+func (n *rootLinkNode) ExecFunction(_ context.Context, f func(ns.NetNS) error) error {
+	netns, err := ns.GetNS(n.nspath)
+	if err != nil {
+		return err
+	}
+	defer netns.Close()
+
+	return netns.Do(f)
+}
+
+func (*rootLinkNode) GetState() clabnodesstate.NodeState {
+	return clabnodesstate.Deployed
+}
+
+func (n *rootLinkNode) Delete(ctx context.Context) error {
+	for _, e := range n.endpoints {
+		if err := e.GetLink().Remove(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // DeployOptions contains options for deploying a lab.
 type DeployOptions struct {
-	TopoPath       string
+	TopoPath string
+	// LabName is the API-authorized lab name. It is required and overrides the
+	// name from the topology so deployment cannot switch to an unchecked lab.
+	LabName        string
 	Username       string
 	Reconfigure    bool
 	MaxWorkers     uint
@@ -62,16 +284,27 @@ type DeployOptions struct {
 	SkipLabDirACLs bool
 }
 
+// ApplyOptions contains options for applying topology changes to a lab.
+type ApplyOptions struct {
+	TopoPath       string
+	Username       string
+	DryRun         bool
+	MaxWorkers     uint
+	ExportTemplate string
+	SkipPostDeploy bool
+}
+
 // DestroyOptions contains options for destroying a lab.
 type DestroyOptions struct {
-	LabName     string
-	TopoPath    string
-	Username    string
-	Graceful    bool
-	Cleanup     bool
-	KeepMgmtNet bool
-	NodeFilter  []string
-	MaxWorkers  uint
+	LabName         string
+	TopoPath        string
+	Username        string
+	Graceful        bool
+	GracefulTimeout time.Duration
+	Cleanup         bool
+	KeepMgmtNet     bool
+	NodeFilter      []string
+	MaxWorkers      uint
 }
 
 // ListOptions contains options for listing labs/containers.
@@ -98,6 +331,11 @@ type SaveOptions struct {
 	NodeFilter []string
 }
 
+type nodeConfigSaver interface {
+	GetShortName() string
+	SaveConfig(context.Context) (*clabnodes.SaveConfigResult, error)
+}
+
 // InspectOptions contains options for inspecting labs.
 type InspectOptions struct {
 	LabName  string
@@ -112,10 +350,229 @@ type InterfacesOptions struct {
 	NodeFilter string
 }
 
+type NodeLifecycleAction string
+
+const (
+	NodeLifecycleActionStart   NodeLifecycleAction = "start"
+	NodeLifecycleActionStop    NodeLifecycleAction = "stop"
+	NodeLifecycleActionRestart NodeLifecycleAction = "restart"
+	NodeLifecycleActionPause   NodeLifecycleAction = "pause"
+	NodeLifecycleActionUnpause NodeLifecycleAction = "unpause"
+)
+
+type NodeLifecycleOptions struct {
+	ContainerName string
+	LabName       string
+	TopoPath      string
+	Username      string
+	NodeNames     []string
+	Action        NodeLifecycleAction
+}
+
+type ContainerlabToolRunOptions struct {
+	Args []string
+}
+
+type DrawioGenerateOptions struct {
+	TopoPath      string
+	Runtime       string
+	Layout        string
+	Theme         string
+	Interactive   bool
+	DrawioVersion string
+}
+
+type DrawioGenerateResult struct {
+	Path   string
+	Output string
+}
+
+type FcliRunOptions struct {
+	Runtime      string
+	Network      string
+	TopologyPath string
+	CommandArgs  []string
+}
+
+type CloneTopologySourceOptions struct {
+	SourceURL string
+	Username  string
+	// WorkDir is the clone's parent directory. Empty uses the user's lab directory.
+	// Callers supplying a temporary directory are responsible for its cleanup.
+	WorkDir string
+}
+
+type CloneTopologySourceResult struct {
+	RepoDir      string
+	RepoName     string
+	TopologyPath string
+}
+
+type ResolveTopologySourceOptions struct {
+	SourcePath string
+	Username   string
+}
+
+type ResolveTopologySourceResult struct {
+	TopologyPath string
+	LabName      string
+}
+
+type RuntimeImageSummary struct {
+	ID          string
+	ShortID     string
+	RepoTags    []string
+	RepoDigests []string
+	CreatedAt   string
+	Size        string
+	VirtualSize string
+}
+
+type runtimeImageCliRecord struct {
+	ID           string `json:"ID"`
+	Repository   string `json:"Repository"`
+	Tag          string `json:"Tag"`
+	Digest       string `json:"Digest"`
+	CreatedAt    string `json:"CreatedAt"`
+	CreatedSince string `json:"CreatedSince"`
+	Size         string `json:"Size"`
+	VirtualSize  string `json:"VirtualSize"`
+}
+
+// CloneTopologySource clones a supported topology source URL and resolves the topology file path.
+func (s *Service) CloneTopologySource(opts CloneTopologySourceOptions) (*CloneTopologySourceResult, error) {
+	sourceURL := strings.TrimSpace(opts.SourceURL)
+	if sourceURL == "" {
+		return nil, fmt.Errorf("topology source URL is required")
+	}
+	if strings.TrimSpace(opts.Username) == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+
+	workDir := opts.WorkDir
+	if workDir == "" {
+		var err error
+		workDir, err = s.prepareWorkDir(opts.Username)
+		if err != nil {
+			return nil, fmt.Errorf("failed to prepare working directory: %w", err)
+		}
+	}
+	workDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve working directory: %w", err)
+	}
+
+	normalizedURL := sourceURL
+	if clabgit.IsGitHubShortURL(normalizedURL) {
+		normalizedURL = "https://github.com/" + normalizedURL
+	}
+
+	repo, err := clabgit.NewRepo(normalizedURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse git URL: %w", err)
+	}
+
+	topoPath, err := s.processGitTopoFile(sourceURL, workDir)
+	if err != nil {
+		return nil, err
+	}
+
+	repoDir := filepath.Join(workDir, repo.GetName())
+
+	// The clone runs as root, so hand it over or the user cannot edit or remove it.
+	if uid, gid, idErr := lookupUserIDs(opts.Username); idErr != nil {
+		log.Warn("Failed to resolve user for cloned topology ownership",
+			"user", opts.Username,
+			"error", idErr,
+		)
+	} else if chownErr := chownTree(repoDir, uid, gid); chownErr != nil {
+		log.Warn("Failed to set ownership on cloned topology",
+			"dir", repoDir,
+			"user", opts.Username,
+			"error", chownErr,
+		)
+	}
+
+	return &CloneTopologySourceResult{
+		RepoDir:      repoDir,
+		RepoName:     repo.GetName(),
+		TopologyPath: topoPath,
+	}, nil
+}
+
+// ResolveTopologySource materializes a topology source and returns its effective lab name after
+// template, environment, and git-variable expansion.
+func (s *Service) ResolveTopologySource(
+	opts ResolveTopologySourceOptions,
+) (*ResolveTopologySourceResult, error) {
+	sourcePath := strings.TrimSpace(opts.SourcePath)
+	if sourcePath == "" {
+		return nil, fmt.Errorf("topology source is required")
+	}
+	if strings.TrimSpace(opts.Username) == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+
+	topologyPath := sourcePath
+	if s.isGitURL(sourcePath) {
+		cloned, err := s.CloneTopologySource(CloneTopologySourceOptions{
+			SourceURL: sourcePath,
+			Username:  opts.Username,
+		})
+		if err != nil {
+			return nil, err
+		}
+		topologyPath = cloned.TopologyPath
+	}
+
+	clab, err := newContainerLabForOwner(
+		opts.Username,
+		clabcore.WithRuntime(config.AppConfig.ClabRuntime, &clabruntime.RuntimeConfig{
+			Timeout: defaultTimeout,
+		}),
+		clabcore.WithTopoPath(topologyPath, nil),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load topology: %w", err)
+	}
+
+	labName := strings.TrimSpace(clab.Config.Name)
+	if labName == "" {
+		return nil, fmt.Errorf("topology name is required")
+	}
+
+	return &ResolveTopologySourceResult{
+		TopologyPath: clab.TopoPaths.TopologyFilenameAbsPath(),
+		LabName:      labName,
+	}, nil
+}
+
+func deployClabOptions(topoPath, labName string, opts DeployOptions) []clabcore.ClabOption {
+	clabOpts := []clabcore.ClabOption{
+		clabcore.WithTimeout(defaultTimeout),
+		clabcore.WithTopoPath(topoPath, nil),
+		clabcore.WithTopologyName(labName),
+		clabcore.WithRuntime(config.AppConfig.ClabRuntime, &clabruntime.RuntimeConfig{
+			Timeout: defaultTimeout,
+		}),
+	}
+
+	if len(opts.NodeFilter) > 0 {
+		clabOpts = append(clabOpts, clabcore.WithNodeFilter(opts.NodeFilter))
+	}
+
+	return clabOpts
+}
+
 // Deploy deploys a lab using the containerlab library.
 func (s *Service) Deploy(ctx context.Context, opts DeployOptions) ([]clabruntime.GenericContainer, error) {
 	ctx, cancel := s.ensureTimeout(ctx)
 	defer cancel()
+
+	labName := strings.TrimSpace(opts.LabName)
+	if labName == "" {
+		return nil, fmt.Errorf("authorized lab name is required")
+	}
 
 	// Prepare clab working directory
 	workDir, err := s.prepareWorkDir(opts.Username)
@@ -136,6 +593,12 @@ func (s *Service) Deploy(ctx context.Context, opts DeployOptions) ([]clabruntime
 	}
 
 	// Change to the work directory for relative path resolution
+	unlock := lockContainerlabOperation()
+	defer unlock()
+
+	restoreOwnerEnv := setProcessOwnerEnv(opts.Username)
+	defer restoreOwnerEnv()
+
 	originalDir, _ := os.Getwd()
 	if chErr := os.Chdir(workDir); chErr != nil {
 		return nil, fmt.Errorf("failed to change to work directory: %w", chErr)
@@ -146,20 +609,6 @@ func (s *Service) Deploy(ctx context.Context, opts DeployOptions) ([]clabruntime
 		}
 	}()
 
-	// Build clab options
-	clabOpts := []clabcore.ClabOption{
-		clabcore.WithTimeout(defaultTimeout),
-		clabcore.WithTopoPath(topoPath, ""),
-		clabcore.WithRuntime(config.AppConfig.ClabRuntime, &clabruntime.RuntimeConfig{
-			Timeout: defaultTimeout,
-		}),
-		clabcore.WithLabOwner(opts.Username),
-	}
-
-	if len(opts.NodeFilter) > 0 {
-		clabOpts = append(clabOpts, clabcore.WithNodeFilter(opts.NodeFilter))
-	}
-
 	log.Debug("Creating containerlab instance",
 		"topoPath", opts.TopoPath,
 		"username", opts.Username,
@@ -167,7 +616,7 @@ func (s *Service) Deploy(ctx context.Context, opts DeployOptions) ([]clabruntime
 	)
 
 	// Create containerlab instance
-	clab, err := clabcore.NewContainerLab(clabOpts...)
+	clab, err := clabcore.NewContainerLab(deployClabOptions(topoPath, labName, opts)...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create containerlab instance: %w", err)
 	}
@@ -192,10 +641,16 @@ func (s *Service) Deploy(ctx context.Context, opts DeployOptions) ([]clabruntime
 		"reconfigure", opts.Reconfigure,
 	)
 
-	// Deploy the lab
-	containers, err := clab.Deploy(ctx, deployOpts)
+	deployResult, err := clab.Deploy(ctx, deployOpts)
+	var containers []clabruntime.GenericContainer
+	if deployResult != nil {
+		containers = deployResult.Containers
+	}
 	if err != nil {
 		return nil, fmt.Errorf("deployment failed: %w", err)
+	}
+	if err := syncLabHostsFiles(ctx, clab); err != nil {
+		return nil, fmt.Errorf("deployment completed but host name resolution setup failed: %w", err)
 	}
 
 	log.Info("Lab deployed successfully",
@@ -204,6 +659,85 @@ func (s *Service) Deploy(ctx context.Context, opts DeployOptions) ([]clabruntime
 	)
 
 	return containers, nil
+}
+
+// Apply applies topology changes to a lab using the containerlab library.
+func (s *Service) Apply(ctx context.Context, opts ApplyOptions) (*clabcore.ApplyResult, error) {
+	ctx, cancel := s.ensureTimeout(ctx)
+	defer cancel()
+
+	if strings.TrimSpace(opts.TopoPath) == "" {
+		return nil, fmt.Errorf("topology path is required")
+	}
+
+	workDir, err := s.prepareWorkDir(opts.Username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to prepare working directory: %w", err)
+	}
+
+	unlock := lockContainerlabOperation()
+	defer unlock()
+
+	restoreOwnerEnv := setProcessOwnerEnv(opts.Username)
+	defer restoreOwnerEnv()
+
+	originalDir, _ := os.Getwd()
+	if chErr := os.Chdir(workDir); chErr != nil {
+		return nil, fmt.Errorf("failed to change to work directory: %w", chErr)
+	}
+	defer func() {
+		if restoreErr := os.Chdir(originalDir); restoreErr != nil {
+			log.Warn("Failed to restore working directory", "error", restoreErr)
+		}
+	}()
+
+	clabOpts := []clabcore.ClabOption{
+		clabcore.WithTimeout(defaultTimeout),
+		clabcore.WithTopoPath(opts.TopoPath, nil),
+		clabcore.WithRuntime(config.AppConfig.ClabRuntime, &clabruntime.RuntimeConfig{
+			Timeout: defaultTimeout,
+		}),
+	}
+
+	log.Debug("Creating containerlab instance for apply",
+		"topoPath", opts.TopoPath,
+		"username", opts.Username,
+		"runtime", config.AppConfig.ClabRuntime,
+	)
+
+	clab, err := clabcore.NewContainerLab(clabOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create containerlab instance: %w", err)
+	}
+
+	applyOpts, err := clabcore.NewApplyOptions(opts.MaxWorkers)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create apply options: %w", err)
+	}
+	applyOpts.SetDryRun(opts.DryRun).
+		SetSkipPostDeploy(opts.SkipPostDeploy).
+		SetExportTemplate(opts.ExportTemplate)
+
+	log.Info("Applying lab topology",
+		"username", opts.Username,
+		"topoPath", opts.TopoPath,
+		"dryRun", opts.DryRun,
+	)
+
+	result, err := clab.Apply(ctx, applyOpts)
+	if err != nil {
+		return nil, fmt.Errorf("apply failed: %w", err)
+	}
+	if result != nil && strings.TrimSpace(result.LabName) == "" {
+		result.LabName = clab.Config.Name
+	}
+	if !opts.DryRun {
+		if err := syncLabHostsFiles(ctx, clab); err != nil {
+			return nil, fmt.Errorf("apply completed but host name resolution setup failed: %w", err)
+		}
+	}
+
+	return result, nil
 }
 
 // Destroy destroys a lab using the containerlab library.
@@ -216,6 +750,9 @@ func (s *Service) Destroy(ctx context.Context, opts DestroyOptions) error {
 	if err != nil {
 		return fmt.Errorf("failed to prepare working directory: %w", err)
 	}
+
+	unlock := lockContainerlabOperation()
+	defer unlock()
 
 	originalDir, _ := os.Getwd()
 	if chErr := os.Chdir(workDir); chErr != nil {
@@ -231,14 +768,17 @@ func (s *Service) Destroy(ctx context.Context, opts DestroyOptions) error {
 	clabTimeout := defaultTimeout
 	if opts.Graceful {
 		clabTimeout = gracefulDestroyTimeout
+		if opts.GracefulTimeout > 0 {
+			clabTimeout = opts.GracefulTimeout
+		}
 	}
 	var clabOpts []clabcore.ClabOption
 	clabOpts = append(clabOpts, clabcore.WithTimeout(clabTimeout))
 
 	if opts.TopoPath != "" {
-		clabOpts = append(clabOpts, clabcore.WithTopoPath(opts.TopoPath, ""))
+		clabOpts = append(clabOpts, clabcore.WithTopoPath(opts.TopoPath, nil))
 	} else if opts.LabName != "" {
-		clabOpts = append(clabOpts, clabcore.WithTopologyFromLab(opts.LabName))
+		clabOpts = append(clabOpts, clabcore.WithTopologyFromLab(opts.LabName, nil))
 	} else {
 		return fmt.Errorf("either lab name or topology path is required")
 	}
@@ -287,12 +827,16 @@ func (s *Service) Destroy(ctx context.Context, opts DestroyOptions) error {
 		"username", opts.Username,
 		"labName", opts.LabName,
 		"graceful", opts.Graceful,
+		"gracefulTimeout", opts.GracefulTimeout,
 		"cleanup", opts.Cleanup,
 	)
 
 	// Destroy the lab
 	if err := clab.Destroy(ctx, destroyOpts...); err != nil {
 		return fmt.Errorf("destroy failed: %w", err)
+	}
+	if err := removeLabHostsFiles(clab.Config.Name); err != nil {
+		return fmt.Errorf("lab destroyed but host name resolution cleanup failed: %w", err)
 	}
 
 	log.Info("Lab destroyed successfully",
@@ -314,7 +858,7 @@ func (s *Service) ListContainers(ctx context.Context, opts ListOptions) ([]clabr
 		clabcore.WithRuntime(config.AppConfig.ClabRuntime, &clabruntime.RuntimeConfig{Timeout: defaultTimeout}),
 	}
 
-	clab, err := clabcore.NewContainerLab(clabOpts...)
+	clab, err := newContainerLab(clabOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create containerlab instance: %w", err)
 	}
@@ -350,6 +894,376 @@ func (s *Service) ListContainers(ctx context.Context, opts ListOptions) ([]clabr
 	return containers, nil
 }
 
+func (s *Service) RunNodeLifecycleAction(ctx context.Context, opts NodeLifecycleOptions) error {
+	ctx, cancel := s.ensureTimeout(ctx)
+	defer cancel()
+
+	switch opts.Action {
+	case NodeLifecycleActionStart, NodeLifecycleActionStop, NodeLifecycleActionRestart:
+		return s.runTopologyNodeLifecycleAction(ctx, opts)
+	case NodeLifecycleActionPause, NodeLifecycleActionUnpause:
+	default:
+		return fmt.Errorf("unsupported node lifecycle action: %q", opts.Action)
+	}
+
+	containerName := strings.TrimSpace(opts.ContainerName)
+	if containerName == "" {
+		return fmt.Errorf("container name is required")
+	}
+
+	rt, err := s.getContainerRuntime()
+	if err != nil {
+		return err
+	}
+
+	switch opts.Action {
+	case NodeLifecycleActionPause:
+		err = rt.PauseContainer(ctx, containerName)
+	case NodeLifecycleActionUnpause:
+		err = rt.UnpauseContainer(ctx, containerName)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to %s container %q: %w", opts.Action, containerName, err)
+	}
+
+	return nil
+}
+
+func (s *Service) RunLabLifecycleAction(ctx context.Context, opts NodeLifecycleOptions) error {
+	ctx, cancel := s.ensureTimeout(ctx)
+	defer cancel()
+
+	switch opts.Action {
+	case NodeLifecycleActionStart, NodeLifecycleActionStop, NodeLifecycleActionRestart:
+		return s.runTopologyNodeLifecycleAction(ctx, opts)
+	default:
+		return fmt.Errorf("unsupported lab lifecycle action: %q", opts.Action)
+	}
+}
+
+func (s *Service) runTopologyNodeLifecycleAction(ctx context.Context, opts NodeLifecycleOptions) error {
+	workDir, err := s.prepareWorkDir(opts.Username)
+	if err != nil {
+		return fmt.Errorf("failed to prepare working directory: %w", err)
+	}
+
+	unlock := lockContainerlabOperation()
+	defer unlock()
+
+	originalDir, _ := os.Getwd()
+	if chErr := os.Chdir(workDir); chErr != nil {
+		return fmt.Errorf("failed to change to work directory: %w", chErr)
+	}
+	defer func() {
+		if restoreErr := os.Chdir(originalDir); restoreErr != nil {
+			log.Warn("Failed to restore working directory", "error", restoreErr)
+		}
+	}()
+
+	clabOpts := []clabcore.ClabOption{
+		clabcore.WithTimeout(defaultTimeout),
+		clabcore.WithRuntime(config.AppConfig.ClabRuntime, &clabruntime.RuntimeConfig{Timeout: defaultTimeout}),
+	}
+
+	topoPath := strings.TrimSpace(opts.TopoPath)
+	labName := strings.TrimSpace(opts.LabName)
+	switch {
+	case topoPath != "":
+		clabOpts = append(clabOpts, clabcore.WithTopoPath(topoPath, nil))
+	case labName != "":
+		clabOpts = append(clabOpts, clabcore.WithTopologyFromLab(labName, nil))
+	default:
+		return fmt.Errorf("either lab name or topology path is required")
+	}
+
+	clab, err := clabcore.NewContainerLab(clabOpts...)
+	if err != nil {
+		return fmt.Errorf("failed to create containerlab instance: %w", err)
+	}
+
+	nodeNames := cleanNodeNames(opts.NodeNames)
+	log.Info("Running topology lifecycle action",
+		"username", opts.Username,
+		"labName", opts.LabName,
+		"topoPath", opts.TopoPath,
+		"action", opts.Action,
+		"nodes", nodeNames,
+	)
+
+	switch opts.Action {
+	case NodeLifecycleActionStart:
+		err = clab.StartNodes(ctx, nodeNames)
+	case NodeLifecycleActionStop:
+		err = clab.StopNodes(ctx, nodeNames)
+	case NodeLifecycleActionRestart:
+		err = clab.RestartNodes(ctx, nodeNames)
+	default:
+		return fmt.Errorf("unsupported topology lifecycle action: %q", opts.Action)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to %s node(s): %w", opts.Action, err)
+	}
+
+	return nil
+}
+
+func cleanNodeNames(nodeNames []string) []string {
+	cleaned := make([]string, 0, len(nodeNames))
+	for _, nodeName := range nodeNames {
+		trimmed := strings.TrimSpace(nodeName)
+		if trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+	return cleaned
+}
+
+func (s *Service) RunContainerlabTool(ctx context.Context, opts ContainerlabToolRunOptions) (string, error) {
+	ctx, cancel := s.ensureTimeout(ctx)
+	defer cancel()
+
+	if len(opts.Args) == 0 {
+		return "", fmt.Errorf("at least one command argument is required")
+	}
+
+	return s.runCommand(ctx, "containerlab", opts.Args)
+}
+
+func configuredRuntimeName() string {
+	runtimeName := strings.TrimSpace(config.AppConfig.ClabRuntime)
+	if runtimeName == "" {
+		return "docker"
+	}
+	return runtimeName
+}
+
+func shortRuntimeImageID(id string) string {
+	trimmed := strings.TrimPrefix(strings.TrimSpace(id), "sha256:")
+	if len(trimmed) <= 12 {
+		return trimmed
+	}
+	return trimmed[:12]
+}
+
+func validImageTag(repository, tag string) string {
+	repository = strings.TrimSpace(repository)
+	tag = strings.TrimSpace(tag)
+	if repository == "" || repository == "<none>" || tag == "" || tag == "<none>" {
+		return ""
+	}
+	return repository + ":" + tag
+}
+
+func validImageDigest(repository, digest string) string {
+	repository = strings.TrimSpace(repository)
+	digest = strings.TrimSpace(digest)
+	if repository == "" || repository == "<none>" || digest == "" || digest == "<none>" {
+		return ""
+	}
+	return repository + "@" + digest
+}
+
+func appendUniqueString(values []string, value string) []string {
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func (s *Service) ListRuntimeImages(ctx context.Context) ([]RuntimeImageSummary, error) {
+	ctx, cancel := s.ensureTimeout(ctx)
+	defer cancel()
+
+	runtimeName := configuredRuntimeName()
+	output, err := s.runCommand(ctx, runtimeName, []string{
+		"image",
+		"ls",
+		"--all",
+		"--digests",
+		"--no-trunc",
+		"--format",
+		"{{json .}}",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	imagesByID := map[string]*RuntimeImageSummary{}
+	order := []string{}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var record runtimeImageCliRecord
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			return nil, fmt.Errorf("failed to parse %s image listing: %w", runtimeName, err)
+		}
+		id := strings.TrimSpace(record.ID)
+		if id == "" {
+			continue
+		}
+		image := imagesByID[id]
+		if image == nil {
+			image = &RuntimeImageSummary{
+				ID:          id,
+				ShortID:     shortRuntimeImageID(id),
+				RepoTags:    []string{},
+				RepoDigests: []string{},
+				CreatedAt:   strings.TrimSpace(record.CreatedAt),
+				Size:        strings.TrimSpace(record.Size),
+				VirtualSize: strings.TrimSpace(record.VirtualSize),
+			}
+			if image.CreatedAt == "" {
+				image.CreatedAt = strings.TrimSpace(record.CreatedSince)
+			}
+			imagesByID[id] = image
+			order = append(order, id)
+		}
+		image.RepoTags = appendUniqueString(image.RepoTags, validImageTag(record.Repository, record.Tag))
+		image.RepoDigests = appendUniqueString(image.RepoDigests, validImageDigest(record.Repository, record.Digest))
+	}
+
+	images := make([]RuntimeImageSummary, 0, len(order))
+	for _, id := range order {
+		images = append(images, *imagesByID[id])
+	}
+	return images, nil
+}
+
+func (s *Service) PullRuntimeImage(ctx context.Context, image string) (string, error) {
+	baseCtx := ctx
+	if _, hasDeadline := baseCtx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		baseCtx, cancel = context.WithTimeout(baseCtx, imagePullTimeout)
+		defer cancel()
+	}
+	return s.runCommand(baseCtx, configuredRuntimeName(), []string{"pull", image})
+}
+
+func (s *Service) RemoveRuntimeImage(ctx context.Context, reference string, force bool) (string, error) {
+	ctx, cancel := s.ensureTimeout(ctx)
+	defer cancel()
+
+	args := []string{"image", "rm"}
+	if force {
+		args = append(args, "--force")
+	}
+	args = append(args, reference)
+	return s.runCommand(ctx, configuredRuntimeName(), args)
+}
+
+func (s *Service) RunFcliCommand(ctx context.Context, opts FcliRunOptions) (string, error) {
+	ctx, cancel := s.ensureTimeout(ctx)
+	defer cancel()
+
+	topologyPath := strings.TrimSpace(opts.TopologyPath)
+	if topologyPath == "" {
+		return "", fmt.Errorf("topology path is required")
+	}
+
+	if len(opts.CommandArgs) == 0 {
+		return "", fmt.Errorf("fcli command is required")
+	}
+
+	runtimeName := strings.TrimSpace(opts.Runtime)
+	if runtimeName == "" {
+		runtimeName = strings.TrimSpace(config.AppConfig.ClabRuntime)
+	}
+	if runtimeName == "" {
+		runtimeName = "docker"
+	}
+
+	networkName := strings.TrimSpace(opts.Network)
+	if networkName == "" {
+		networkName = "clab"
+	}
+
+	args := []string{
+		"run",
+		"--pull", "always",
+		"--rm",
+		"--network", networkName,
+		"-v", "/etc/hosts:/etc/hosts:ro",
+		"-v", fmt.Sprintf("%s:/topo.yml", topologyPath),
+		"ghcr.io/srl-labs/nornir-srl:latest",
+		"-t", "/topo.yml",
+	}
+	args = append(args, opts.CommandArgs...)
+
+	return s.runCommand(ctx, runtimeName, args)
+}
+
+func (s *Service) GenerateDrawioFile(ctx context.Context, opts DrawioGenerateOptions) (DrawioGenerateResult, error) {
+	ctx, cancel := s.ensureTimeout(ctx)
+	defer cancel()
+
+	topoPath := strings.TrimSpace(opts.TopoPath)
+	if topoPath == "" {
+		return DrawioGenerateResult{}, fmt.Errorf("topology path is required")
+	}
+
+	runtimeName := strings.TrimSpace(opts.Runtime)
+	if runtimeName == "" {
+		runtimeName = strings.TrimSpace(config.AppConfig.ClabRuntime)
+	}
+	if runtimeName == "" {
+		runtimeName = "docker"
+	}
+
+	layout := strings.ToLower(strings.TrimSpace(opts.Layout))
+	if layout == "" {
+		layout = "horizontal"
+	}
+	if layout != "horizontal" && layout != "vertical" {
+		return DrawioGenerateResult{}, fmt.Errorf("unsupported drawio layout: %q", layout)
+	}
+
+	theme := strings.TrimSpace(opts.Theme)
+	if theme == "" {
+		theme = "nokia_modern"
+	}
+
+	args := []string{
+		"graph",
+		"-r", runtimeName,
+		"--drawio",
+	}
+
+	if drawioVersion := strings.TrimSpace(opts.DrawioVersion); drawioVersion != "" {
+		args = append(args, "--drawio-version", drawioVersion)
+	}
+
+	if opts.Interactive {
+		args = append(args, "--drawio-args", "-I")
+	} else {
+		args = append(args, "--drawio-args", fmt.Sprintf("--theme %s --layout %s", theme, layout))
+	}
+
+	args = append(args, "-t", topoPath)
+
+	output, err := s.runCommand(ctx, "containerlab", args)
+	if err != nil {
+		return DrawioGenerateResult{}, err
+	}
+
+	drawioPath := drawioOutputPathFromTopo(topoPath)
+	if _, err := os.Stat(drawioPath); err != nil {
+		return DrawioGenerateResult{}, fmt.Errorf("drawio output file not found at %q: %w", drawioPath, err)
+	}
+
+	return DrawioGenerateResult{
+		Path:   drawioPath,
+		Output: output,
+	}, nil
+}
+
 // ListContainerInterfaces lists interfaces for a specific container.
 func (s *Service) ListContainerInterfaces(ctx context.Context, container *clabruntime.GenericContainer) (*clabtypes.ContainerInterfaces, error) {
 	ctx, cancel := s.ensureTimeout(ctx)
@@ -360,7 +1274,7 @@ func (s *Service) ListContainerInterfaces(ctx context.Context, container *clabru
 		clabcore.WithRuntime(config.AppConfig.ClabRuntime, &clabruntime.RuntimeConfig{Timeout: defaultTimeout}),
 	}
 
-	clab, err := clabcore.NewContainerLab(clabOpts...)
+	clab, err := newContainerLab(clabOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create containerlab instance: %w", err)
 	}
@@ -383,7 +1297,7 @@ func (s *Service) ListContainersInterfaces(ctx context.Context, containers []cla
 		clabcore.WithRuntime(config.AppConfig.ClabRuntime, &clabruntime.RuntimeConfig{Timeout: defaultTimeout}),
 	}
 
-	clab, err := clabcore.NewContainerLab(clabOpts...)
+	clab, err := newContainerLab(clabOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create containerlab instance: %w", err)
 	}
@@ -407,6 +1321,9 @@ func (s *Service) Exec(ctx context.Context, opts ExecOptions) (*clabexec.ExecCol
 		return nil, fmt.Errorf("failed to prepare working directory: %w", err)
 	}
 
+	unlock := lockContainerlabOperation()
+	defer unlock()
+
 	originalDir, _ := os.Getwd()
 	if chErr := os.Chdir(workDir); chErr != nil {
 		return nil, fmt.Errorf("failed to change to work directory: %w", chErr)
@@ -421,7 +1338,7 @@ func (s *Service) Exec(ctx context.Context, opts ExecOptions) (*clabexec.ExecCol
 	var clabOpts []clabcore.ClabOption
 	clabOpts = append(clabOpts, clabcore.WithTimeout(defaultTimeout))
 	if opts.TopoPath != "" {
-		clabOpts = append(clabOpts, clabcore.WithTopoPath(opts.TopoPath, ""))
+		clabOpts = append(clabOpts, clabcore.WithTopoPath(opts.TopoPath, nil))
 	}
 	clabOpts = append(clabOpts,
 		clabcore.WithRuntime(config.AppConfig.ClabRuntime, &clabruntime.RuntimeConfig{Timeout: defaultTimeout}),
@@ -469,6 +1386,9 @@ func (s *Service) SaveConfig(ctx context.Context, opts SaveOptions) error {
 		return fmt.Errorf("failed to prepare working directory: %w", err)
 	}
 
+	unlock := lockContainerlabOperation()
+	defer unlock()
+
 	originalDir, _ := os.Getwd()
 	if chErr := os.Chdir(workDir); chErr != nil {
 		return fmt.Errorf("failed to change to work directory: %w", chErr)
@@ -481,12 +1401,8 @@ func (s *Service) SaveConfig(ctx context.Context, opts SaveOptions) error {
 
 	clabOpts := []clabcore.ClabOption{
 		clabcore.WithTimeout(defaultTimeout),
-		clabcore.WithTopoPath(opts.TopoPath, ""),
+		clabcore.WithTopoPath(opts.TopoPath, nil),
 		clabcore.WithRuntime(config.AppConfig.ClabRuntime, &clabruntime.RuntimeConfig{Timeout: defaultTimeout}),
-	}
-
-	if len(opts.NodeFilter) > 0 {
-		clabOpts = append(clabOpts, clabcore.WithNodeFilter(opts.NodeFilter))
 	}
 
 	clab, err := clabcore.NewContainerLab(clabOpts...)
@@ -499,8 +1415,22 @@ func (s *Service) SaveConfig(ctx context.Context, opts SaveOptions) error {
 		"topoPath", opts.TopoPath,
 	)
 
-	// Save config for each node
-	if err := clab.Save(ctx); err != nil {
+	savers, err := selectNodeConfigSavers(clab.Nodes, opts.NodeFilter)
+	if err != nil {
+		return err
+	}
+	// Refresh the whole lab's entries even when only selected nodes are saved.
+	if err := syncLabHostsFiles(ctx, clab); err != nil {
+		return fmt.Errorf("failed to prepare host name resolution: %w", err)
+	}
+
+	if clab.Config.Mgmt != nil {
+		if err := clablinks.SetMgmtNetUnderlyingBridge(clab.Config.Mgmt.Bridge); err != nil {
+			return fmt.Errorf("failed to configure management bridge: %w", err)
+		}
+	}
+
+	if err := saveNodeConfigs(ctx, savers); err != nil {
 		return fmt.Errorf("save failed: %w", err)
 	}
 
@@ -509,6 +1439,46 @@ func (s *Service) SaveConfig(ctx context.Context, opts SaveOptions) error {
 	)
 
 	return nil
+}
+
+func selectNodeConfigSavers(nodes map[string]clabnodes.Node, nodeFilter []string) ([]nodeConfigSaver, error) {
+	for _, name := range nodeFilter {
+		if _, ok := nodes[name]; !ok {
+			return nil, fmt.Errorf("node %q is not present in the topology", name)
+		}
+	}
+	var savers []nodeConfigSaver
+	for name, node := range nodes {
+		if len(nodeFilter) == 0 || slices.Contains(nodeFilter, name) {
+			savers = append(savers, node)
+		}
+	}
+	return savers, nil
+}
+
+func saveNodeConfigs(ctx context.Context, nodes []nodeConfigSaver) error {
+	var wg sync.WaitGroup
+	errorsCh := make(chan error, len(nodes))
+
+	for _, node := range nodes {
+		wg.Add(1)
+		go func(node nodeConfigSaver) {
+			defer wg.Done()
+			if _, err := node.SaveConfig(ctx); err != nil {
+				errorsCh <- fmt.Errorf("node %q: %w", node.GetShortName(), err)
+			}
+		}(node)
+	}
+
+	wg.Wait()
+	close(errorsCh)
+
+	var saveErrors []error
+	for err := range errorsCh {
+		saveErrors = append(saveErrors, err)
+	}
+
+	return errors.Join(saveErrors...)
 }
 
 // CACreateOptions contains options for creating a CA.
@@ -664,7 +1634,7 @@ func (s *Service) DisableTxOffload(ctx context.Context, opts DisableTxOffloadOpt
 		clabcore.WithRuntime(config.AppConfig.ClabRuntime, &clabruntime.RuntimeConfig{Timeout: defaultTimeout}),
 	}
 
-	clab, err := clabcore.NewContainerLab(clabOpts...)
+	clab, err := newContainerLab(clabOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to create containerlab instance: %w", err)
 	}
@@ -743,7 +1713,7 @@ func (s *Service) CreateVeth(ctx context.Context, opts VethCreateOptions) error 
 		clabcore.WithRuntime(config.AppConfig.ClabRuntime, &clabruntime.RuntimeConfig{Timeout: defaultTimeout}),
 	}
 
-	clab, err := clabcore.NewContainerLab(clabOpts...)
+	clab, err := newContainerLab(clabOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to create containerlab instance: %w", err)
 	}
@@ -754,20 +1724,19 @@ func (s *Service) CreateVeth(ctx context.Context, opts VethCreateOptions) error 
 		return fmt.Errorf("failed to create nodes: %w", err)
 	}
 
-	// Create link brief
-	linkBrief := &clablinks.LinkBriefRaw{
-		Endpoints: []string{
-			fmt.Sprintf("%s:%s", parsedAEnd.Node, parsedAEnd.Iface),
-			fmt.Sprintf("%s:%s", parsedBEnd.Node, parsedBEnd.Iface),
+	hostNode, err := newRootLinkNode("host")
+	if err != nil {
+		return fmt.Errorf("failed to create host link node: %w", err)
+	}
+
+	linkRaw := &clablinks.LinkVEthRaw{
+		Endpoints: []*clablinks.EndpointRaw{
+			clablinks.NewEndpointRaw(parsedAEnd.Node, parsedAEnd.Iface, ""),
+			clablinks.NewEndpointRaw(parsedBEnd.Node, parsedBEnd.Iface, ""),
 		},
 		LinkCommonParams: clablinks.LinkCommonParams{
 			MTU: opts.MTU,
 		},
-	}
-
-	linkRaw, err := linkBrief.ToTypeSpecificRawLink()
-	if err != nil {
-		return fmt.Errorf("failed to convert link brief: %w", err)
 	}
 
 	// Copy nodes to links.Nodes
@@ -775,6 +1744,7 @@ func (s *Service) CreateVeth(ctx context.Context, opts VethCreateOptions) error 
 	for k, v := range clab.Nodes {
 		resolveNodes[k] = v
 	}
+	resolveNodes["host"] = hostNode
 
 	link, err := linkRaw.Resolve(&clablinks.ResolveParams{Nodes: resolveNodes})
 	if err != nil {
@@ -783,7 +1753,9 @@ func (s *Service) CreateVeth(ctx context.Context, opts VethCreateOptions) error 
 
 	// Deploy the endpoints
 	for _, ep := range link.GetEndpoints() {
-		ep.Deploy(ctx)
+		if err := ep.GetLink().Deploy(ctx, ep); err != nil {
+			return fmt.Errorf("failed to deploy endpoint %s: %w", ep, err)
+		}
 	}
 
 	log.Info("veth pair created successfully",
@@ -900,6 +1872,12 @@ func (s *Service) CreateVxlan(ctx context.Context, opts VxlanCreateOptions) erro
 		parentDevice = r.Interface.Name
 	}
 
+	hostNode, err := newRootLinkNode("host")
+	if err != nil {
+		return fmt.Errorf("failed to create host link node: %w", err)
+	}
+
+	vxlanIface := "vx-" + opts.Link
 	vxlraw := &clablinks.LinkVxlanRaw{
 		Remote:          opts.Remote,
 		VNI:             opts.ID,
@@ -909,15 +1887,14 @@ func (s *Service) CreateVxlan(ctx context.Context, opts VxlanCreateOptions) erro
 		},
 		DstPort:  opts.DstPort,
 		SrcPort:  opts.SrcPort,
-		LinkType: clablinks.LinkTypeVxlanStitch,
-		Endpoint: *clablinks.NewEndpointRaw("host", opts.Link, ""),
+		LinkType: clablinks.LinkTypeVxlan,
+		Endpoint: *clablinks.NewEndpointRaw("host", vxlanIface, ""),
 	}
 
 	rp := &clablinks.ResolveParams{
 		Nodes: map[string]clablinks.Node{
-			"host": clablinks.GetHostLinkNode(),
+			"host": hostNode,
 		},
-		VxlanIfaceNameOverwrite: opts.Link,
 	}
 
 	link, err := vxlraw.Resolve(rp)
@@ -925,14 +1902,28 @@ func (s *Service) CreateVxlan(ctx context.Context, opts VxlanCreateOptions) erro
 		return fmt.Errorf("failed to resolve VxLAN link: %w", err)
 	}
 
-	vxl, ok := link.(*clablinks.VxlanStitched)
+	vxl, ok := link.(*clablinks.LinkVxlan)
 	if !ok {
-		return fmt.Errorf("resolved link is not a VxlanStitched link")
+		return fmt.Errorf("resolved link is not a LinkVxlan link")
 	}
 
-	err = vxl.DeployWithExistingVeth(ctx)
-	if err != nil {
+	endpoints := vxl.GetEndpoints()
+	if len(endpoints) == 0 {
+		return fmt.Errorf("resolved VxLAN link has no endpoints")
+	}
+
+	if err := vxl.Deploy(ctx, endpoints[0]); err != nil {
 		return fmt.Errorf("failed to deploy VxLAN: %w", err)
+	}
+
+	if err := stitchInterfaces(vxlanIface, opts.Link); err != nil {
+		_ = vxl.Remove(ctx)
+		return fmt.Errorf("failed to stitch VxLAN to link: %w", err)
+	}
+
+	if err := stitchInterfaces(opts.Link, vxlanIface); err != nil {
+		_ = vxl.Remove(ctx)
+		return fmt.Errorf("failed to stitch link to VxLAN: %w", err)
 	}
 
 	log.Info("VxLAN tunnel created successfully",
@@ -942,6 +1933,57 @@ func (s *Service) CreateVxlan(ctx context.Context, opts VxlanCreateOptions) erro
 	)
 
 	return nil
+}
+
+func stitchInterfaces(srcIface, dstIface string) error {
+	src, err := netlink.LinkByName(srcIface)
+	if err != nil {
+		return fmt.Errorf("failed to lookup %q: %w", srcIface, err)
+	}
+
+	dst, err := netlink.LinkByName(dstIface)
+	if err != nil {
+		return fmt.Errorf("failed to lookup %q: %w", dstIface, err)
+	}
+
+	qdisc := &netlink.Ingress{
+		QdiscAttrs: netlink.QdiscAttrs{
+			LinkIndex: src.Attrs().Index,
+			Handle:    netlink.MakeHandle(0xffff, 0),
+			Parent:    netlink.HANDLE_INGRESS,
+		},
+	}
+	if err := netlink.QdiscAdd(qdisc); err != nil && !os.IsExist(err) {
+		return err
+	}
+
+	filter := &netlink.U32{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: src.Attrs().Index,
+			Parent:    netlink.MakeHandle(0xffff, 0),
+			Protocol:  syscall.ETH_P_ALL,
+		},
+		Sel: &netlink.TcU32Sel{
+			Keys: []netlink.TcU32Key{
+				{
+					Mask: 0x0,
+					Val:  0,
+				},
+			},
+			Flags: netlink.TC_U32_TERMINAL,
+		},
+		Actions: []netlink.Action{
+			&netlink.MirredAction{
+				ActionAttrs: netlink.ActionAttrs{
+					Action: netlink.TC_ACT_STOLEN,
+				},
+				MirredAction: netlink.TCA_EGRESS_REDIR,
+				Ifindex:      dst.Attrs().Index,
+			},
+		},
+	}
+
+	return netlink.FilterAdd(filter)
 }
 
 // DeleteVxlan deletes VxLAN tunnels matching a prefix.
@@ -1024,7 +2066,7 @@ func (s *Service) SetNetem(ctx context.Context, opts NetemSetOptions) error {
 	}()
 
 	err = nodeNS.Do(func(_ ns.NetNS) error {
-		netemIfLink, err := netlink.LinkByName(clablinks.SanitizeInterfaceName(opts.Interface))
+		netemIfLink, err := resolveNetemLink(opts.Interface)
 		if err != nil {
 			var lnf netlink.LinkNotFoundError
 			if errors.As(err, &lnf) {
@@ -1068,6 +2110,30 @@ func (s *Service) SetNetem(ctx context.Context, opts NetemSetOptions) error {
 	return nil
 }
 
+func resolveNetemLink(iface string) (netlink.Link, error) {
+	netemIfLink, err := netlink.LinkByName(clabutils.SanitizeInterfaceName(iface))
+	if err == nil {
+		return netemIfLink, nil
+	}
+
+	var lnf netlink.LinkNotFoundError
+	if !errors.As(err, &lnf) {
+		return nil, err
+	}
+
+	links, listErr := netlink.LinkList()
+	if listErr != nil {
+		return nil, listErr
+	}
+	for _, link := range links {
+		if link.Attrs().Alias == iface {
+			return link, nil
+		}
+	}
+
+	return nil, err
+}
+
 // ResetNetem removes netem impairments from a specific interface in a container's network namespace.
 func (s *Service) ResetNetem(ctx context.Context, containerName, iface string) error {
 	ctx, cancel := s.ensureTimeout(ctx)
@@ -1100,7 +2166,7 @@ func (s *Service) ResetNetem(ctx context.Context, containerName, iface string) e
 	}()
 
 	return nodeNS.Do(func(_ ns.NetNS) error {
-		netemIfLink, err := netlink.LinkByName(clablinks.SanitizeInterfaceName(iface))
+		netemIfLink, err := resolveNetemLink(iface)
 		if err != nil {
 			var lnf netlink.LinkNotFoundError
 			if errors.As(err, &lnf) {
@@ -1114,8 +2180,57 @@ func (s *Service) ResetNetem(ctx context.Context, containerName, iface string) e
 			return fmt.Errorf("%w: %s", ErrNetemInterfaceNotFound, netemIfLink.Attrs().Name)
 		}
 
-		return clabnetem.DeleteImpairments(tcnl, netemIfIface)
+		qdiscs, qdiscErr := clabnetem.Impairments(tcnl)
+		if qdiscErr == nil && !hasNetemQdisc(qdiscs, netemIfIface.Index) {
+			log.Debug("netem reset skipped because interface has no netem qdisc",
+				"container", containerName,
+				"interface", iface,
+			)
+			return nil
+		}
+		if qdiscErr != nil {
+			log.Debug("failed to pre-check netem qdiscs before reset",
+				"container", containerName,
+				"interface", iface,
+				"err", qdiscErr,
+			)
+		}
+
+		if err := clabnetem.DeleteImpairments(tcnl, netemIfIface); err != nil {
+			if isNetemAlreadyClearError(err) {
+				log.Debug("netem reset delete raced with already-cleared qdisc",
+					"container", containerName,
+					"interface", iface,
+					"err", err,
+				)
+				return nil
+			}
+			return err
+		}
+
+		return nil
 	})
+}
+
+func hasNetemQdisc(qdiscs []gotc.Object, ifaceIndex int) bool {
+	for idx := range qdiscs {
+		if int(qdiscs[idx].Ifindex) == ifaceIndex && qdiscs[idx].Attribute.Kind == "netem" {
+			return true
+		}
+	}
+	return false
+}
+
+func isNetemAlreadyClearError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "invalid argument") ||
+		strings.Contains(message, "no such file") ||
+		strings.Contains(message, "not found") ||
+		strings.Contains(message, "could not find qdisc") ||
+		strings.Contains(message, "cannot find qdisc")
 }
 
 // ShowNetem returns the current netem impairments for interfaces that have netem qdisc set.
@@ -1178,7 +2293,7 @@ func (s *Service) getContainerRuntime() (clabruntime.ContainerRuntime, error) {
 		clabcore.WithRuntime(config.AppConfig.ClabRuntime, &clabruntime.RuntimeConfig{Timeout: defaultTimeout}),
 	}
 
-	clab, err := clabcore.NewContainerLab(clabOpts...)
+	clab, err := newContainerLab(clabOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create containerlab instance: %w", err)
 	}
@@ -1449,6 +2564,32 @@ func (s *Service) generateTopologyConfig(
 	return yaml.Marshal(config)
 }
 
+// lookupUserIDs resolves a username to its numeric uid/gid.
+func lookupUserIDs(username string) (uid, gid int, err error) {
+	usr, err := user.Lookup(username)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to lookup user: %w", err)
+	}
+	if uid, err = strconv.Atoi(usr.Uid); err != nil {
+		return 0, 0, fmt.Errorf("failed to parse uid for %q: %w", username, err)
+	}
+	if gid, err = strconv.Atoi(usr.Gid); err != nil {
+		return 0, 0, fmt.Errorf("failed to parse gid for %q: %w", username, err)
+	}
+	return uid, gid, nil
+}
+
+// chownTree transfers ownership of path and everything below it to uid:gid.
+// Symlinks are changed rather than followed, so a link cannot retarget the chown.
+func chownTree(path string, uid, gid int) error {
+	return filepath.WalkDir(path, func(p string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Lchown(p, uid, gid)
+	})
+}
+
 // prepareWorkDir prepares the working directory for a user.
 func (s *Service) prepareWorkDir(username string) (string, error) {
 	usr, err := user.Lookup(username)
@@ -1462,9 +2603,8 @@ func (s *Service) prepareWorkDir(username string) (string, error) {
 	}
 
 	// Try to set ownership of the .clab directory to the actual user
-	uid, uidErr := strconv.Atoi(usr.Uid)
-	gid, gidErr := strconv.Atoi(usr.Gid)
-	if uidErr == nil && gidErr == nil {
+	uid, gid, idErr := lookupUserIDs(username)
+	if idErr == nil {
 		if chownErr := os.Chown(clabDir, uid, gid); chownErr != nil {
 			log.Warn("Failed to set ownership on .clab directory",
 				"dir", clabDir,
@@ -1485,6 +2625,14 @@ func (s *Service) ensureTimeout(ctx context.Context) (context.Context, context.C
 	return ctx, func() {}
 }
 
+// gitRepoInDirectory supplies an explicit clone destination to containerlab's Git helper.
+type gitRepoInDirectory struct {
+	clabgit.GitRepo
+	dir string
+}
+
+func (r gitRepoInDirectory) GetName() string { return r.dir }
+
 // processGitTopoFile handles GitHub/GitLab URLs by cloning the repo and returning
 // the local path to the topology file. This mirrors the CLI behavior.
 func (s *Service) processGitTopoFile(topo, workDir string) (string, error) {
@@ -1498,17 +2646,13 @@ func (s *Service) processGitTopoFile(topo, workDir string) (string, error) {
 		return "", fmt.Errorf("failed to parse git URL: %w", err)
 	}
 
-	// Change to workdir so the repo is cloned there
-	originalDir, _ := os.Getwd()
-	if chErr := os.Chdir(workDir); chErr != nil {
-		return "", fmt.Errorf("failed to change to work directory for git clone: %w", chErr)
+	repoDir, err := filepath.Abs(filepath.Join(workDir, repo.GetName()))
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve clone directory: %w", err)
 	}
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
 
-	// Instantiate the git implementation
-	gitImpl := clabgit.NewGoGit(repo)
+	// Use an absolute destination so concurrent clones do not change each other's cwd.
+	gitImpl := clabgit.NewGoGit(gitRepoInDirectory{GitRepo: repo, dir: repoDir})
 
 	// Clone the repo
 	log.Debug("Cloning git repository", "url", topo, "workDir", workDir)
@@ -1517,12 +2661,12 @@ func (s *Service) processGitTopoFile(topo, workDir string) (string, error) {
 	}
 
 	// Adjust permissions for the checked out repo
-	if err := clabutils.SetUIDAndGID(repo.GetName()); err != nil {
+	if err := clabutils.SetUIDAndGID(repoDir); err != nil {
 		log.Warn("Error adjusting repository permissions, continuing anyways", "error", err)
 	}
 
 	// Find the topology file in the cloned repo
-	repoPath := filepath.Join(workDir, repo.GetName())
+	repoPath := repoDir
 
 	// If a specific path was provided in the URL, use it
 	if len(repo.GetPath()) > 0 {
@@ -1545,6 +2689,38 @@ func (s *Service) processGitTopoFile(topo, workDir string) (string, error) {
 	}
 
 	return topoFile, nil
+}
+
+func (s *Service) runCommand(ctx context.Context, name string, args []string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	output, err := cmd.CombinedOutput()
+	trimmed := strings.TrimSpace(string(output))
+	if err != nil {
+		if trimmed == "" {
+			return "", fmt.Errorf("command %s %s failed: %w", name, strings.Join(args, " "), err)
+		}
+		return trimmed, fmt.Errorf(
+			"command %s %s failed: %w: %s",
+			name,
+			strings.Join(args, " "),
+			err,
+			trimmed,
+		)
+	}
+
+	return trimmed, nil
+}
+
+func drawioOutputPathFromTopo(topoPath string) string {
+	lowerPath := strings.ToLower(topoPath)
+	switch {
+	case strings.HasSuffix(lowerPath, ".yaml"):
+		return topoPath[:len(topoPath)-len(".yaml")] + ".drawio"
+	case strings.HasSuffix(lowerPath, ".yml"):
+		return topoPath[:len(topoPath)-len(".yml")] + ".drawio"
+	default:
+		return topoPath + ".drawio"
+	}
 }
 
 // isGitURL checks if the given path is a GitHub or GitLab URL that needs to be cloned.

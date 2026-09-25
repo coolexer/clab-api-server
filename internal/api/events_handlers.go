@@ -29,7 +29,7 @@ const (
 )
 
 type labOwnershipEntry struct {
-	owner     string
+	allowed   bool
 	expiresAt time.Time
 }
 
@@ -173,49 +173,105 @@ func StreamEventsHandler(c *gin.Context) {
 		}
 		now := time.Now()
 		if entry, ok := ownershipCache[lab]; ok && now.Before(entry.expiresAt) {
-			return entry.owner == username
+			return entry.allowed
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), labOwnershipLookupLimit)
 		defer cancel()
 		info, exists, lookupErr := getLabInfo(ctx, username, lab)
-		owner := ""
+		allowed := false
 		if lookupErr == nil && exists && info != nil {
-			owner = info.Owner
+			allowed = canAccessLab(username, info)
 		}
 		ownershipCache[lab] = labOwnershipEntry{
-			owner:     owner,
+			allowed:   allowed,
 			expiresAt: now.Add(labOwnershipCacheTTL),
 		}
-		return owner == username
+		return allowed
 	}
 
 	scanner := bufio.NewScanner(streamReader)
 	scanner.Buffer(make([]byte, 0, 64*1024), eventsScannerMaxBytes)
 
-	c.Stream(func(w io.Writer) bool {
+	scanLines := make(chan string)
+	scanErrCh := make(chan error, 1)
+	go func() {
+		defer close(scanLines)
+		defer func() {
+			scanErrCh <- scanner.Err()
+		}()
 		for scanner.Scan() {
-			line := scanner.Text()
+			select {
+			case scanLines <- scanner.Text():
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	writer := bufio.NewWriter(c.Writer)
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		return
+	}
+	heartbeat := time.NewTicker(ndjsonStreamHeartbeatInterval)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-heartbeat.C:
+			if !writeNDJSONHeartbeat(writer, flusher) {
+				return
+			}
+		case line, ok := <-scanLines:
+			if !ok {
+				cancel()
+				if err := <-streamErrCh; err != nil && ctx.Err() == nil {
+					log.Warnf("StreamEvents user '%s': Events stream ended with error: %v", username, err)
+				}
+				if err := <-scanErrCh; err != nil && ctx.Err() == nil {
+					log.Errorf("StreamEvents user '%s': Scanner error: %v", username, err)
+				}
+				return
+			}
 			if !isSuperuserUser {
-				labName, ok := extractLabFromEventLine(line)
-				if !ok || !allowedLab(labName) {
+				if !canAccessEventLine(username, line, allowedLab) {
 					continue
 				}
 			}
-			if _, err := io.WriteString(w, line+"\n"); err != nil {
-				return false
+			if !writeNDJSONLine(writer, flusher, line) {
+				return
 			}
-			return true
 		}
-		return false
-	})
+	}
+}
 
-	cancel()
-	if err := <-streamErrCh; err != nil && ctx.Err() == nil {
-		log.Warnf("StreamEvents user '%s': Events stream ended with error: %v", username, err)
+// Container events retain their trusted runtime labels after deletion. Checking
+// the live lab at that point can suppress destroy events or reuse a cached grant
+// for a different lab that later takes the same name.
+func canAccessEventLine(username, line string, allowedLab func(string) bool) bool {
+	var evt clabEventJSON
+	if err := json.Unmarshal([]byte(line), &evt); err != nil {
+		return false
 	}
-	if err := scanner.Err(); err != nil && ctx.Err() == nil {
-		log.Errorf("StreamEvents user '%s': Scanner error: %v", username, err)
+	lab := evt.Attributes["lab"]
+	if lab == "" {
+		lab = evt.Attributes["containerlab"]
 	}
+	if lab == "" {
+		return false
+	}
+	owner := evt.Attributes["clab-owner"]
+	path := evt.Attributes["clab-topo-file"]
+	if path == "" {
+		path = evt.Attributes["lab-path"]
+	}
+	if owner != "" && path != "" {
+		return owner == username || isSharedLabPath(path)
+	}
+	// Interface events and older runtimes may not include ownership labels.
+	return allowedLab(lab)
 }
 
 func parseBoolQuery(c *gin.Context, name string, defaultValue bool) (bool, error) {
@@ -225,26 +281,3 @@ func parseBoolQuery(c *gin.Context, name string, defaultValue bool) (bool, error
 	}
 	return strconv.ParseBool(raw)
 }
-
-func extractLabFromEventLine(line string) (string, bool) {
-	return extractLabFromJSONLine(line)
-}
-
-func extractLabFromJSONLine(line string) (string, bool) {
-	var evt clabEventJSON
-	if err := json.Unmarshal([]byte(line), &evt); err != nil {
-		return "", false
-	}
-	if evt.Attributes == nil {
-		return "", false
-	}
-	if lab := evt.Attributes["lab"]; lab != "" {
-		return lab, true
-	}
-	if lab := evt.Attributes["containerlab"]; lab != "" {
-		return lab, true
-	}
-	return "", false
-}
-
-// Plain-text event parsing removed; NDJSON-only output is supported.

@@ -2,28 +2,44 @@
 package config
 
 import (
-	"fmt" // Import fmt
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/viper"
 )
 
 type Config struct {
-	APIPort        string        `mapstructure:"API_PORT"`
-	JWTSecret      string        `mapstructure:"JWT_SECRET"`
-	JWTExpiration  time.Duration `mapstructure:"JWT_EXPIRATION"`  // Renamed for clarity - uses time.Duration directly
-	APIUserGroup   string        `mapstructure:"API_USER_GROUP"`  // Group required for basic API login (alternative to clab_admins)
-	SuperuserGroup string        `mapstructure:"SUPERUSER_GROUP"` // Group for elevated privileges
-	ClabRuntime    string        `mapstructure:"CLAB_RUNTIME"`
-	LogLevel       string        `mapstructure:"LOG_LEVEL"`
-	TLSEnable      bool          `mapstructure:"TLS_ENABLE"`
-	TLSCertFile    string        `mapstructure:"TLS_CERT_FILE"`
-	TLSKeyFile     string        `mapstructure:"TLS_KEY_FILE"`
-	GinMode        string        `mapstructure:"GIN_MODE"`
-	TrustedProxies string        `mapstructure:"TRUSTED_PROXIES"`
-	APIServerHost  string        `mapstructure:"API_SERVER_HOST"` // Host/IP/FQDN used for SSH access commands
-	SSHBasePort    int           `mapstructure:"SSH_BASE_PORT"`   // Base port for SSH proxy allocation
-	SSHMaxPort     int           `mapstructure:"SSH_MAX_PORT"`    // Maximum port for SSH proxy allocation
+	APIPort                      string        `mapstructure:"API_PORT"`
+	JWTSecret                    string        `mapstructure:"JWT_SECRET"`
+	JWTExpiration                time.Duration `mapstructure:"JWT_EXPIRATION"`  // Renamed for clarity - uses time.Duration directly
+	APIUserGroup                 string        `mapstructure:"API_USER_GROUP"`  // Group required for basic API login (alternative to clab_admins)
+	SuperuserGroup               string        `mapstructure:"SUPERUSER_GROUP"` // Group for elevated privileges
+	ClabRuntime                  string        `mapstructure:"CLAB_RUNTIME"`
+	ClabLabsRoot                 string        `mapstructure:"CLAB_LABS_ROOT"`
+	ClabSharedLabsRoot           string        `mapstructure:"CLAB_SHARED_LABS_ROOT"`
+	ClabHostsFile                string        `mapstructure:"CLAB_HOSTS_FILE"`
+	CapturePacketflixPort        int           `mapstructure:"CAPTURE_PACKETFLIX_PORT"`
+	CaptureRemoteHostname        string        `mapstructure:"CAPTURE_REMOTE_HOSTNAME"`
+	CaptureWiresharkDockerImage  string        `mapstructure:"CAPTURE_WIRESHARK_DOCKER_IMAGE"`
+	CaptureWiresharkPullPolicy   string        `mapstructure:"CAPTURE_WIRESHARK_PULL_POLICY"`
+	CaptureWiresharkSessionTTL   time.Duration `mapstructure:"CAPTURE_WIRESHARK_SESSION_TTL"`
+	CaptureEdgesharkExtraEnvVars string        `mapstructure:"CAPTURE_EDGESHARK_EXTRA_ENV_VARS"`
+	LogLevel                     string        `mapstructure:"LOG_LEVEL"`
+	CORSAllowedOrigins           string        `mapstructure:"CORS_ALLOWED_ORIGINS"` // Comma-separated list of allowed browser origins
+	TLSEnable                    bool          `mapstructure:"TLS_ENABLE"`
+	TLSAutoCert                  bool          `mapstructure:"TLS_AUTO_CERT"`
+	TLSCertFile                  string        `mapstructure:"TLS_CERT_FILE"`
+	TLSKeyFile                   string        `mapstructure:"TLS_KEY_FILE"`
+	GinMode                      string        `mapstructure:"GIN_MODE"`
+	TrustedProxies               string        `mapstructure:"TRUSTED_PROXIES"`
+	APIServerHost                string        `mapstructure:"API_SERVER_HOST"` // Host/IP/FQDN used for SSH access commands
+	SSHBasePort                  int           `mapstructure:"SSH_BASE_PORT"`   // Base port for SSH proxy allocation
+	SSHMaxPort                   int           `mapstructure:"SSH_MAX_PORT"`    // Maximum port for SSH proxy allocation
+	TerminalMaxSessionsPerUser   int           `mapstructure:"TERMINAL_MAX_SESSIONS_PER_USER"`
 }
 
 var AppConfig Config
@@ -35,14 +51,25 @@ func LoadConfig(envFilePath string) error {
 	viper.AutomaticEnv() // Read from environment variables as fallback/override
 
 	// --- Set Defaults ---
-	viper.SetDefault("API_PORT", "8080")
+	viper.SetDefault("API_PORT", "8090")
 	viper.SetDefault("JWT_SECRET", "default_secret_change_me")
-	viper.SetDefault("JWT_EXPIRATION", "60m") // Default 60 minutes, but now accepts any duration format
+	viper.SetDefault("JWT_EXPIRATION", "24h") // Default 24 hours, but now accepts any duration format
 	viper.SetDefault("API_USER_GROUP", "")
 	viper.SetDefault("SUPERUSER_GROUP", "")
 	viper.SetDefault("CLAB_RUNTIME", "docker")
+	viper.SetDefault("CLAB_LABS_ROOT", "")
+	viper.SetDefault("CLAB_SHARED_LABS_ROOT", "")
+	viper.SetDefault("CLAB_HOSTS_FILE", "")
+	viper.SetDefault("CAPTURE_PACKETFLIX_PORT", 5001)
+	viper.SetDefault("CAPTURE_REMOTE_HOSTNAME", "")
+	viper.SetDefault("CAPTURE_WIRESHARK_DOCKER_IMAGE", "ghcr.io/srl-labs/wireshark-vnc-docker:latest")
+	viper.SetDefault("CAPTURE_WIRESHARK_PULL_POLICY", "always")
+	viper.SetDefault("CAPTURE_WIRESHARK_SESSION_TTL", "2h")
+	viper.SetDefault("CAPTURE_EDGESHARK_EXTRA_ENV_VARS", "")
 	viper.SetDefault("LOG_LEVEL", "info")
-	viper.SetDefault("TLS_ENABLE", false)
+	viper.SetDefault("CORS_ALLOWED_ORIGINS", "")
+	viper.SetDefault("TLS_ENABLE", true)
+	viper.SetDefault("TLS_AUTO_CERT", true)
 	viper.SetDefault("TLS_CERT_FILE", "")
 	viper.SetDefault("TLS_KEY_FILE", "")
 	viper.SetDefault("GIN_MODE", "debug")
@@ -50,16 +77,18 @@ func LoadConfig(envFilePath string) error {
 	viper.SetDefault("API_SERVER_HOST", "")
 	viper.SetDefault("SSH_BASE_PORT", 2223) // Default base port for SSH proxy
 	viper.SetDefault("SSH_MAX_PORT", 2322)  // Default max port for SSH proxy (allows 100 sessions)
+	viper.SetDefault("TERMINAL_MAX_SESSIONS_PER_USER", 128)
 
 	err := viper.ReadInConfig()
 
 	// Handle file not found error specifically
 	if err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+		var configFileNotFound viper.ConfigFileNotFoundError
+		if errors.As(err, &configFileNotFound) || errors.Is(err, os.ErrNotExist) {
 			// If the default file path was used and it wasn't found, it's okay.
 			// If a specific path was provided via flag and it wasn't found, it's an error.
 			defaultPath := ".env" // The default path we'll set in main.go
-			if envFilePath != defaultPath {
+			if envFilePath != defaultPath && envFilePath != "" {
 				return fmt.Errorf("specified config file '%s' not found: %w", envFilePath, err)
 			}
 			// Otherwise (default path not found), just log a debug message and continue
@@ -76,6 +105,45 @@ func LoadConfig(envFilePath string) error {
 	err = viper.Unmarshal(&AppConfig)
 	if err != nil {
 		return fmt.Errorf("unable to decode config into struct: %w", err)
+	}
+
+	AppConfig.ClabLabsRoot = strings.TrimSpace(AppConfig.ClabLabsRoot)
+	if AppConfig.ClabLabsRoot != "" {
+		if strings.HasPrefix(AppConfig.ClabLabsRoot, "~") {
+			return fmt.Errorf("CLAB_LABS_ROOT must be an absolute path; '~' is not supported")
+		}
+		if !filepath.IsAbs(AppConfig.ClabLabsRoot) {
+			return fmt.Errorf("CLAB_LABS_ROOT must be an absolute path")
+		}
+		AppConfig.ClabLabsRoot = filepath.Clean(AppConfig.ClabLabsRoot)
+	}
+
+	AppConfig.ClabSharedLabsRoot = strings.TrimSpace(AppConfig.ClabSharedLabsRoot)
+	if AppConfig.ClabSharedLabsRoot != "" {
+		if !filepath.IsAbs(AppConfig.ClabSharedLabsRoot) {
+			return fmt.Errorf("CLAB_SHARED_LABS_ROOT must be an absolute path")
+		}
+		AppConfig.ClabSharedLabsRoot = filepath.Clean(AppConfig.ClabSharedLabsRoot)
+		if AppConfig.ClabSharedLabsRoot == string(filepath.Separator) {
+			return fmt.Errorf("CLAB_SHARED_LABS_ROOT must not be the filesystem root")
+		}
+		if AppConfig.ClabLabsRoot != "" {
+			rel, err := filepath.Rel(AppConfig.ClabSharedLabsRoot, AppConfig.ClabLabsRoot)
+			if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("CLAB_SHARED_LABS_ROOT must not contain CLAB_LABS_ROOT")
+			}
+		}
+	}
+
+	AppConfig.ClabHostsFile = strings.TrimSpace(AppConfig.ClabHostsFile)
+	if AppConfig.ClabHostsFile != "" {
+		if strings.HasPrefix(AppConfig.ClabHostsFile, "~") {
+			return fmt.Errorf("CLAB_HOSTS_FILE must be an absolute path; '~' is not supported")
+		}
+		if !filepath.IsAbs(AppConfig.ClabHostsFile) {
+			return fmt.Errorf("CLAB_HOSTS_FILE must be an absolute path")
+		}
+		AppConfig.ClabHostsFile = filepath.Clean(AppConfig.ClabHostsFile)
 	}
 
 	// No need to convert - the value is already a time.Duration thanks to the type in the struct

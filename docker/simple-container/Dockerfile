@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # Set noninteractive frontend for apt-get
 ENV DEBIAN_FRONTEND=noninteractive
@@ -30,6 +30,7 @@ RUN echo \
   tee /etc/apt/sources.list.d/docker.list > /dev/null
 RUN apt-get update && apt-get install -y --no-install-recommends \
     docker-ce-cli \
+    docker-compose-plugin \
  && rm -rf /var/lib/apt/lists/*
 
 # User setup
@@ -46,11 +47,17 @@ RUN groupadd --system docker && \
 WORKDIR /app
 
 # ARG to specify the target architecture (automatically set by Buildx)
-ARG TARGETARCH=amd64
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+      amd64|arm64) ;; \
+      "") echo "TARGETARCH must be set by Buildx" >&2; exit 1 ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac
 
 # Copy the correct pre-built binary based on the target architecture
 COPY dist/clab-api-server-linux-${TARGETARCH} /usr/local/bin/clab-api-server
-RUN chmod +x /usr/local/bin/clab-api-server
+RUN chmod +x /usr/local/bin/clab-api-server && \
+    /usr/local/bin/clab-api-server -v
 
 # Copy the example .env file to provide configuration
 COPY .env.example /app/.env

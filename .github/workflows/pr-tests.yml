@@ -13,17 +13,121 @@ permissions:
   contents: read
 
 jobs:
+  container-image-arch:
+    name: Container image architecture
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: WillAbides/setup-go-faster@v1.19.0
+        with:
+          go-version: "1.27.1"
+
+      - name: Cache Go modules
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-container-image-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Configure apt and install cross tool-chain
+        run: |
+          set -euxo pipefail
+          sudo dpkg --add-architecture arm64
+          sudo sed -Ei 's|http://azure\.archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list
+          sudo sed -Ei 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          sudo tee /etc/apt/sources.list.d/arm64-ports.list > /dev/null <<'EOF'
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-backports main restricted universe multiverse
+          EOF
+          for i in {1..5}; do sudo apt-get update -qq && break || sleep 5; done
+          for i in {1..5}; do \
+            sudo apt-get install -y --no-install-recommends \
+              build-essential \
+              file \
+              gcc-aarch64-linux-gnu \
+              linux-libc-dev:arm64 \
+              libpam0g-dev \
+              libpam0g-dev:arm64 \
+            && break || { sudo apt-get -y --fix-broken install || true; sleep 5; }; \
+          done
+
+      - name: Build release binaries
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+          go build -trimpath -o dist/clab-api-server-linux-amd64 ./cmd/server
+          CC=aarch64-linux-gnu-gcc \
+          PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig \
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+          go build -trimpath -o dist/clab-api-server-linux-arm64 ./cmd/server
+          chmod +x dist/clab-api-server-linux-*
+
+      - name: Verify release binary architectures
+        run: |
+          set -euxo pipefail
+          file dist/clab-api-server-linux-amd64 | tee /tmp/clab-api-server-linux-amd64.file
+          file dist/clab-api-server-linux-arm64 | tee /tmp/clab-api-server-linux-arm64.file
+          grep -q 'x86-64' /tmp/clab-api-server-linux-amd64.file
+          grep -q 'ARM aarch64' /tmp/clab-api-server-linux-arm64.file
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and smoke test amd64 image
+        run: |
+          set -euxo pipefail
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            -t clab-api-server-ci:amd64 \
+            -f ./docker/simple-container/Dockerfile \
+            .
+          docker run --rm \
+            --platform linux/amd64 \
+            --entrypoint /usr/local/bin/clab-api-server \
+            clab-api-server-ci:amd64 \
+            -v
+
+      - name: Build and smoke test arm64 image
+        run: |
+          set -euxo pipefail
+          docker buildx build \
+            --platform linux/arm64 \
+            --load \
+            -t clab-api-server-ci:arm64 \
+            -f ./docker/simple-container/Dockerfile \
+            .
+          docker run --rm \
+            --platform linux/arm64 \
+            --entrypoint /usr/local/bin/clab-api-server \
+            clab-api-server-ci:arm64 \
+            -v
+
   tests-go:
     name: API + containerlab tests
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Ensure runner workspace env (act compatibility)
         if: env.RUNNER_WORKSPACE == ''
-        run: echo "RUNNER_WORKSPACE=${GITHUB_WORKSPACE}/.runner-workspace" >> "$GITHUB_ENV"
+        run: echo "RUNNER_WORKSPACE=${GITHUB_WORKSPACE}/.runner-workspace" >>
+          "$GITHUB_ENV"
 
       - name: Generate tests_go/.env
         run: |
@@ -37,12 +141,12 @@ jobs:
           fi
 
       - name: Set up Go
-        uses: WillAbides/setup-go-faster@v1.14.0
+        uses: WillAbides/setup-go-faster@v1.19.0
         with:
-          go-version: '1.24.x'
+          go-version: "1.27.1"
 
       - name: Cache Go modules
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/go/pkg/mod
@@ -105,16 +209,18 @@ jobs:
 
       - name: Start API server
         run: |
-          sudo bash -c "cd '$PWD' && env API_SERVER_HOST=127.0.0.1 ./dist/clab-api-server -env-file .env > server.log 2>&1 & echo \$! > server.pid"
+          sudo bash -c "cd '$PWD' && env API_SERVER_HOST=127.0.0.1 CLAB_SHARED_LABS_ROOT=/tmp/clab-shared-labs-ci ./dist/clab-api-server -env-file .env > server.log 2>&1 & echo \$! > server.pid"
           sudo chown "$USER:$USER" server.log server.pid
           sleep 5
 
       - name: Wait for API readiness
-        run: timeout 60 bash -c 'until curl -fsS http://127.0.0.1:8080/health >/dev/null; do sleep 2; done'
+        run: timeout 60 bash -c 'until curl -kfsS https://127.0.0.1:8090/health
+          >/dev/null; do sleep 2; done'
 
       - name: Run Task tests
         env:
           GOTEST_LOG_LEVEL: debug
+          GOTEST_SHARED_LABS: 'true'
         run: task test
 
       - name: Stop API server
@@ -123,6 +229,31 @@ jobs:
           if [ -f server.pid ]; then
             sudo kill "$(cat server.pid)" || true
           fi
+
+      - name: Test containerized saves
+        run: |
+          set -euo pipefail
+          cp dist/clab-api-server dist/clab-api-server-linux-amd64
+          docker build --build-arg TARGETARCH=amd64 \
+            -t clab-api-server-ci:save -f docker/simple-container/Dockerfile .
+          trap 'docker logs clab-api-server-save-test; docker rm -f clab-api-server-save-test' EXIT
+          docker run -d --name clab-api-server-save-test \
+            --privileged --network host --pid host \
+            -e API_PORT=18090 -e API_SERVER_HOST=127.0.0.1 \
+            -e TLS_ENABLE=false -e JWT_SECRET="$(openssl rand -hex 32)" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /var/run/netns:/var/run/netns \
+            -v /etc/passwd:/etc/passwd:ro \
+            -v /etc/shadow:/etc/shadow:ro \
+            -v /etc/group:/etc/group:ro \
+            -v /etc/gshadow:/etc/gshadow:ro \
+            -v /home:/home \
+            clab-api-server-ci:save
+          timeout 60 bash -c 'until curl -fsS http://127.0.0.1:18090/health >/dev/null; do sleep 2; done'
+          # JWT issue timestamps have one-second precision; avoid the startup second.
+          sleep 1
+          API_URL=http://127.0.0.1:18090 GOTEST_LAB_NAME_PREFIX=container-save \
+            go test -count=1 -v ./tests_go -run '^TestLabConfigSuite/TestSaveLabConfig'
 
       - name: Dump API server logs
         if: always()
@@ -133,7 +264,7 @@ jobs:
 
       - name: Upload HTML test report
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: go-test-report
           path: test-reports/test-report.html
