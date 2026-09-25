@@ -1,0 +1,61 @@
+name: Publish API Docs
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Publish ReDoc to gh-pages
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Prepare static site
+        run: |
+          set -euo pipefail
+          rm -rf public
+          mkdir -p public
+          cp docs-site/index.html public/index.html
+          cp docs/swagger.json public/swagger.json
+          cp docs/swagger.yaml public/swagger.yaml
+          touch public/.nojekyll
+
+      - name: Publish to gh-pages
+        run: |
+          set -euo pipefail
+
+          repo_dir="$PWD"
+          publish_dir="$(mktemp -d)"
+          cleanup() {
+            cd "$repo_dir"
+            git worktree remove --force "$publish_dir" >/dev/null 2>&1 || rm -rf "$publish_dir"
+          }
+          trap cleanup EXIT
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages --depth=1
+
+          git worktree add "$publish_dir" origin/gh-pages
+          cp -a public/. "$publish_dir"/
+
+          cd "$publish_dir"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No API docs changes to publish."
+            exit 0
+          fi
+
+          git commit -m "publish api docs"
+          git push origin HEAD:gh-pages

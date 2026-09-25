@@ -9,8 +9,9 @@ import (
 
 // LoginRequest represents the payload for the login endpoint
 type LoginRequest struct {
-	Username string `json:"username" binding:"required"`
-	Password string `json:"password" binding:"required"`
+	Username        string `json:"username" binding:"required"`
+	Password        string `json:"password" binding:"required"`
+	SessionDuration string `json:"sessionDuration,omitempty" example:"24h"`
 }
 
 // LoginResponse represents the payload returned after successful login
@@ -76,6 +77,21 @@ type RedeployRequest struct {
 	SkipLabdirAcl  bool   `json:"skipLabdirAcl,omitempty"`  // Corresponds to --skip-labdir-acl flag
 }
 
+// ApplyLabResponse summarizes changes from a containerlab apply operation.
+type ApplyLabResponse struct {
+	DryRun            bool              `json:"dryRun"`
+	DeployedLab       bool              `json:"deployedLab"`
+	LabName           string            `json:"labName"`
+	AddedNodes        []string          `json:"addedNodes"`
+	DeletedNodes      []string          `json:"deletedNodes"`
+	RecreatedNodes    []string          `json:"recreatedNodes"`
+	StartedNodes      []string          `json:"startedNodes"`
+	AddedLinks        []string          `json:"addedLinks"`
+	DeletedEndpoints  []string          `json:"deletedEndpoints"`
+	RestartedNodes    []string          `json:"restartedNodes"`
+	NodeChangeReasons map[string]string `json:"nodeChangeReasons"`
+}
+
 // ErrorResponse represents a standard error message format
 type ErrorResponse struct {
 	Error string `json:"error" example:"Invalid credentials or user not in allowed group"`
@@ -84,6 +100,30 @@ type ErrorResponse struct {
 // GenericSuccessResponse for simple success messages
 type GenericSuccessResponse struct {
 	Message string `json:"message"`
+}
+
+// SimpleSuccessResponse for operations that only return a boolean success flag.
+type SimpleSuccessResponse struct {
+	Success bool `json:"success" example:"true"`
+}
+
+// TopologyDocEventResponse describes a streamed topology document change event.
+type TopologyDocEventResponse struct {
+	Type         string `json:"type" example:"topology-doc"`
+	LabName      string `json:"labName" example:"mylab"`
+	Path         string `json:"path" example:"mylab.clab.yml.annotations.json"`
+	DocumentKind string `json:"documentKind" example:"annotations"`
+	Action       string `json:"action" example:"change"`
+	Revision     string `json:"revision" example:"yaml=123-456;annotations=78-910"`
+}
+
+// WorkspaceFileEventResponse describes a streamed workspace filesystem change event.
+type WorkspaceFileEventResponse struct {
+	Type       string `json:"type" example:"workspace-file"`
+	Path       string `json:"path" example:"lab1/configs/startup.cfg"`
+	ParentPath string `json:"parentPath" example:"lab1/configs"`
+	Kind       string `json:"kind,omitempty" example:"file"`
+	Action     string `json:"action" example:"delete"`
 }
 
 // --- Structs for parsing `clab inspect --format json` output ---
@@ -104,6 +144,7 @@ type ClabContainerInfo struct {
 	IPv4Address string `json:"ipv4_address"` // Management IPv4 Address/Mask
 	IPv6Address string `json:"ipv6_address"` // Management IPv6 Address/Mask
 	LabName     string `json:"lab_name"`     // Name of the lab this node belongs to (redundant with map key but present)
+	NodeName    string `json:"nodeName"`     // Topology node name from containerlab labels
 	LabPath     string `json:"labPath"`      // Path to the topology file used (relative)
 	AbsLabPath  string `json:"absLabPath"`   // Absolute path to topology file
 	Group       string `json:"group"`        // Group assigned in topology (Might not always be present)
@@ -114,7 +155,7 @@ type ClabContainerInfo struct {
 // It wraps the container list together with the raw topology-data.json produced by containerlab.
 type InspectLabResponse struct {
 	Containers   []ClabContainerInfo `json:"containers"`
-	TopologyData json.RawMessage     `json:"topology_data,omitempty"`
+	TopologyData json.RawMessage     `json:"topology_data,omitempty" swaggertype:"object"`
 }
 
 // --- Structs for parsing `clab inspect interfaces --format json` output ---
@@ -195,7 +236,7 @@ type GenerateResponse struct {
 	// The output from the deploy command (only if Deploy=true). JSON object keyed by lab name.
 	// Use swaggertype:"object" to represent json.RawMessage in Swagger.
 	DeployOutput json.RawMessage `json:"deployOutput,omitempty" swaggertype:"object"`
-	// Path where the file was saved (if Deploy=true, it's the path in the user's ~/.clab dir; if Deploy=false, it's the OutputFile path if provided).
+	// Path where the file was saved (if Deploy=true, it's the path in the user's managed lab directory; if Deploy=false, it's the OutputFile path if provided).
 	SavedFilePath string `json:"savedFilePath,omitempty"`
 }
 
@@ -205,6 +246,56 @@ type SaveConfigResponse struct {
 	Message string `json:"message"`
 	// Detailed output from the 'clab save' command (often from stderr).
 	Output string `json:"output"`
+}
+
+// TopologyEntry describes an editable topology file exposed to the standalone UI.
+type TopologyEntry struct {
+	LabName             string `json:"labName"`
+	AbsolutePath        string `json:"absolutePath,omitempty"` // Exact source path for matching runtime lab paths; file operations use yamlFileName.
+	YamlFileName        string `json:"yamlFileName"`           // Topology path relative to the managed workspace root.
+	AnnotationsFileName string `json:"annotationsFileName"`    // Sidecar path relative to the managed workspace root.
+	HasAnnotations      bool   `json:"hasAnnotations"`
+	DeploymentState     string `json:"deploymentState"` // undeployed (runtime state is derived from events stream)
+}
+
+// TopologyFileRenameRequest describes a scoped file rename operation inside a lab directory.
+type TopologyFileRenameRequest struct {
+	OldPath string `json:"oldPath" binding:"required" example:"configs/startup.cfg"`
+	NewPath string `json:"newPath" binding:"required" example:"configs/startup.bak.cfg"`
+}
+
+// WorkspaceFileEntry describes one file or directory inside the user's editable lab workspace.
+type WorkspaceFileEntry struct {
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	Kind        string `json:"kind"` // file or directory
+	Size        int64  `json:"size"`
+	ModifiedAt  string `json:"modifiedAt"`
+	HasChildren bool   `json:"hasChildren"`
+}
+
+// WorkspaceFileRenameRequest describes a scoped workspace file rename operation.
+type WorkspaceFileRenameRequest struct {
+	OldPath string `json:"oldPath" binding:"required" example:"lab1/configs/startup.cfg"`
+	NewPath string `json:"newPath" binding:"required" example:"lab1/configs/startup.bak.cfg"`
+}
+
+// WorkspaceDirectoryRequest describes a scoped workspace directory creation operation.
+type WorkspaceDirectoryRequest struct {
+	Path string `json:"path" binding:"required" example:"lab1/configs"`
+}
+
+// ImportTopologyFromURLRequest describes an undeployed topology import from a remote source URL.
+type ImportTopologyFromURLRequest struct {
+	TopologySourceUrl string `json:"topologySourceUrl" binding:"required"`
+}
+
+// ImportTopologyFromURLResponse describes the result of an undeployed topology import.
+type ImportTopologyFromURLResponse struct {
+	Success  bool          `json:"success"`
+	LabName  string        `json:"labName"`
+	FileName string        `json:"fileName"`
+	Topology TopologyEntry `json:"topology"`
 }
 
 // --- Structs for Tools ---
